@@ -35,7 +35,9 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
         if not header.startswith("Bearer "):
             return JSONResponse(status_code=401, content={"detail": "Bearer token required"})
         try:
-            current_verifier = request.app.state.verifier or GoogleTokenVerifier(Settings().google_oauth_client_id)
+            if request.app.state.verifier is None:
+                request.app.state.verifier = GoogleTokenVerifier(Settings().google_oauth_client_id)
+            current_verifier = request.app.state.verifier
             request.state.user = current_verifier.verify(header[7:])
             tenant_match = re.match(r"/api/v1/(?:tree|logs|dashboard|wiki)/([^/]+)", request.url.path)
             if tenant_match:
