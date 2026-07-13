@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS users (google_sub TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tenants (tenant_id TEXT PRIMARY KEY, owner_google_sub TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, FOREIGN KEY(owner_google_sub) REFERENCES users(google_sub));
+CREATE TABLE IF NOT EXISTS tenant_members (tenant_id TEXT NOT NULL, google_sub TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','guest')), joined_at TEXT NOT NULL, PRIMARY KEY(tenant_id,google_sub), FOREIGN KEY(tenant_id) REFERENCES tenants(tenant_id), FOREIGN KEY(google_sub) REFERENCES users(google_sub));
+CREATE TABLE IF NOT EXISTS tenant_invitations (invitation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, email TEXT NOT NULL, invited_by_google_sub TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected','revoked')), created_at TEXT NOT NULL, resolved_at TEXT, FOREIGN KEY(tenant_id) REFERENCES tenants(tenant_id));
+CREATE INDEX IF NOT EXISTS tenant_invitations_email_status ON tenant_invitations(email,status);

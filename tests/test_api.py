@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.identity import User
 from app.storage import ObjectNotFound, PreconditionFailed, StoredObject
 
 
@@ -35,9 +36,23 @@ class MemoryStorage:
         return [key for key in self.objects if key.startswith(prefix)]
 
 
+class TestVerifier:
+    def verify(self, token: str) -> User:
+        if token != "test-token":
+            raise Exception("invalid token")
+        return User(google_sub="owner", email="owner@example.com")
+
+
+class OwnerIdentity:
+    def role_for(self, user: User, tenant_id: str) -> str:
+        return "owner"
+
+
 def api() -> tuple[TestClient, MemoryStorage]:
     storage = MemoryStorage({})
-    return TestClient(create_app(storage)), storage
+    client = TestClient(create_app(storage, identity=OwnerIdentity(), verifier=TestVerifier()))
+    client.headers["Authorization"] = "Bearer test-token"
+    return client, storage
 
 
 def payload(title: str = "Reunión de diseño") -> dict[str, object]:

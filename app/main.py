@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,22 +9,60 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.content import validate_identifier
 from app.service import SourceAlreadyExists, WikiService
 from app.storage import ObjectNotFound, ObjectStorage, R2Storage, StorageError
+from app.auth import GoogleTokenVerifier
+from app.config import Settings
+from app.identity import D1Store, IdentityStore, User
 
 
-def create_app(storage: ObjectStorage | None = None) -> FastAPI:
+def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | None = None, verifier: GoogleTokenVerifier | None = None) -> FastAPI:
     app = FastAPI(title="MeetPulse Wiki API", version="1.0.0")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:3118", "http://127.0.0.1:3118", "http://tauri.localhost", "https://tauri.localhost"],
-        allow_methods=["GET", "POST", "PUT"],
-        allow_headers=["content-type"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["content-type", "authorization"],
     )
     app.state.storage = storage
+    app.state.identity = identity
+    app.state.verifier = verifier
+
+    @app.middleware("http")
+    async def authenticate(request: Request, call_next):
+        if request.method == "OPTIONS" or request.url.path in {"/docs", "/openapi.json", "/redoc"}:
+            return await call_next(request)
+        from fastapi.responses import JSONResponse
+        header = request.headers.get("authorization", "")
+        if not header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"detail": "Bearer token required"})
+        try:
+            current_verifier = request.app.state.verifier or GoogleTokenVerifier(Settings().google_oauth_client_id)
+            request.state.user = current_verifier.verify(header[7:])
+            tenant_match = re.match(r"/api/v1/(?:tree|logs|dashboard|wiki)/([^/]+)", request.url.path)
+            if tenant_match:
+                active_store = request.app.state.identity
+                if active_store is None:
+                    settings = Settings(); active_store = D1Store(settings.cloudflare_account_id, settings.cloudflare_d1_database_id, settings.cloudflare_d1_api_token); request.app.state.identity = active_store
+                if active_store.role_for(request.state.user, tenant_match.group(1)) is None:
+                    return JSONResponse(status_code=403, content={"detail": "You do not have access to this tenant"})
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return await call_next(request)
 
     def service(request: Request) -> WikiService:
         if request.app.state.storage is None:
             request.app.state.storage = R2Storage.from_environment()
         return WikiService(request.app.state.storage)
+
+    def identities(request: Request) -> IdentityStore:
+        if request.app.state.identity is None:
+            settings = Settings()
+            request.app.state.identity = D1Store(settings.cloudflare_account_id, settings.cloudflare_d1_database_id, settings.cloudflare_d1_api_token)
+        return request.app.state.identity
+
+    def current_user(request: Request) -> User: return request.state.user
+    def require_owner(request: Request, tenant_id: str) -> None:
+        if identities(request).role_for(current_user(request), tenant_id) != "owner":
+            raise HTTPException(status_code=403, detail="Only the tenant owner can manage users")
 
     def identifier(value: str, field: str) -> str:
         try:
@@ -41,6 +80,8 @@ def create_app(storage: ObjectStorage | None = None) -> FastAPI:
         tenant_id, client_id, project_id = (
             identifier(tenant_id, "tenant_id"), identifier(client_id, "client_id"), identifier(project_id, "project_id")
         )
+        if identities(request).role_for(current_user(request), tenant_id) is None:
+            raise HTTPException(status_code=403, detail="You do not have access to this tenant")
         if not file.filename or not file.filename.lower().endswith(".md"):
             raise HTTPException(status_code=422, detail="file must have a .md extension")
         try:
@@ -164,6 +205,54 @@ def create_app(storage: ObjectStorage | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail={"key": str(exc)}) from exc
         except StorageError as exc:
             raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
+
+    @app.post("/api/v1/tenants/provision")
+    def provision_tenant(request: Request) -> dict[str, object]:
+        return identities(request).provision(current_user(request))
+
+    @app.get("/api/v1/tenants")
+    def list_tenants(request: Request) -> dict[str, object]:
+        return {"items": identities(request).tenants_for(current_user(request))}
+
+    @app.get("/api/v1/me/invitations")
+    def my_invitations(request: Request) -> dict[str, object]:
+        return {"items": identities(request).pending(current_user(request))}
+
+    @app.post("/api/v1/me/invitations/{invitation_id}/accept")
+    def accept_invitation(request: Request, invitation_id: str) -> dict[str, object]:
+        try:
+            return identities(request).respond(current_user(request), invitation_id, "accepted")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/me/invitations/{invitation_id}/reject")
+    def reject_invitation(request: Request, invitation_id: str) -> dict[str, object]:
+        try:
+            return identities(request).respond(current_user(request), invitation_id, "rejected")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tenants/{tenant_id}/members")
+    def list_members(request: Request, tenant_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id"); require_owner(request, tenant_id)
+        return {"items": identities(request).members(current_user(request), tenant_id)}
+
+    @app.post("/api/v1/tenants/{tenant_id}/invitations", status_code=201)
+    def create_invitation(request: Request, tenant_id: str, email: str = Body(..., embed=True)) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id"); require_owner(request, tenant_id)
+        if "@" not in email or len(email) > 320:
+            raise HTTPException(status_code=422, detail="A valid email is required")
+        return identities(request).invite(current_user(request), tenant_id, email)
+
+    @app.get("/api/v1/tenants/{tenant_id}/invitations")
+    def list_invitations(request: Request, tenant_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id"); require_owner(request, tenant_id)
+        return {"items": identities(request).invitations(current_user(request), tenant_id)}
+
+    @app.delete("/api/v1/tenants/{tenant_id}/members/{member_sub}", status_code=204)
+    def revoke_member(request: Request, tenant_id: str, member_sub: str) -> None:
+        tenant_id = identifier(tenant_id, "tenant_id"); require_owner(request, tenant_id)
+        identities(request).revoke(current_user(request), tenant_id, member_sub)
 
     return app
 
