@@ -10,7 +10,7 @@ from app.content import validate_identifier
 from app.service import SourceAlreadyExists, WikiService
 from app.storage import ObjectNotFound, ObjectStorage, R2Storage, StorageError
 from app.auth import GoogleTokenVerifier
-from app.config import Settings
+from app.config import CorsSettings, Settings
 from app.identity import D1Store, IdentityStore, User
 
 
@@ -18,7 +18,7 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
     app = FastAPI(title="MeetPulse Wiki API", version="1.0.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3118", "http://127.0.0.1:3118", "http://tauri.localhost", "https://tauri.localhost"],
+        allow_origins=CorsSettings().allowed_origins(),
         allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["content-type", "authorization"],
     )

@@ -13,6 +13,12 @@ Copy-Item .env.example .env
 
 Completa `.env` con el endpoint S3 de R2, bucket y credenciales de lectura/escritura. `R2_REGION` debe permanecer como `auto`.
 
+## Despliegue en Vercel
+
+Vercel detecta `api/index.py` como el punto de entrada de FastAPI. Importa el repositorio y configura todas las variables de `.env.example` en **Settings → Environment Variables**. Añade además `CORS_ALLOWED_ORIGINS` con los dominios del frontend separados por comas, por ejemplo `https://app.meetpulse.com,https://meetpulse-web.vercel.app`.
+
+Antes del primer despliegue, aplica las migraciones de `migrations/` en Cloudflare D1. Las credenciales de R2 y el token de D1 se mantienen exclusivamente como variables secretas de Vercel.
+
 ## Endpoints
 
 - `POST /api/v1/ingest`: `multipart/form-data` con `file` (`.md` UTF-8), `tenant_id`, `client_id`, `project_id`, `title`, `date_time` y uno o más campos `participants`.

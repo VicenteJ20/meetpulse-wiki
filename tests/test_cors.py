@@ -33,3 +33,19 @@ def test_wiki_ingest_preflight_allows_post() -> None:
 
     assert response.status_code == 200
     assert "POST" in response.headers["access-control-allow-methods"]
+
+
+def test_preflight_allows_configured_production_origin(monkeypatch) -> None:
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://meetpulse-web.vercel.app")
+    client = TestClient(create_app())
+
+    response = client.options(
+        "/api/v1/dashboard/tenant_1/summary",
+        headers={
+            "Origin": "https://meetpulse-web.vercel.app",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://meetpulse-web.vercel.app"
