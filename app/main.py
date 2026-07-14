@@ -208,9 +208,27 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
         except StorageError as exc:
             raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
 
-    @app.post("/api/v1/tenants/provision")
-    def provision_tenant(request: Request) -> dict[str, object]:
-        return identities(request).provision(current_user(request))
+    @app.get("/api/v1/tenants/availability")
+    def tenant_availability(request: Request, name: str = Query(...)) -> dict[str, object]:
+        try:
+            return identities(request).tenant_available(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tenants/provision", status_code=201)
+    async def provision_tenant(request: Request) -> dict[str, object]:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Request body must be JSON with a tenant name") from exc
+        name = payload.get("name") if isinstance(payload, dict) else None
+        if not isinstance(name, str):
+            raise HTTPException(status_code=422, detail="A tenant name is required")
+        try:
+            return identities(request).provision(current_user(request), name)
+        except ValueError as exc:
+            status_code = 409 if "already in use" in str(exc) else 422
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
     @app.get("/api/v1/tenants")
     def list_tenants(request: Request) -> dict[str, object]:

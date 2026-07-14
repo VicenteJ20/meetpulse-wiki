@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import uuid4
+import re
+import unicodedata
 
 import httpx
 
@@ -16,7 +18,9 @@ class User:
 
 
 class IdentityStore(Protocol):
-    def provision(self, user: User) -> dict[str, Any]: ...
+    def provision(self, user: User, name: str) -> dict[str, Any]: ...
+    def tenant_id_for_name(self, name: str) -> str: ...
+    def tenant_available(self, name: str) -> dict[str, Any]: ...
     def tenants_for(self, user: User) -> list[dict[str, Any]]: ...
     def role_for(self, user: User, tenant_id: str) -> str | None: ...
     def invite(self, owner: User, tenant_id: str, email: str) -> dict[str, Any]: ...
@@ -41,13 +45,32 @@ class D1Store:
     def user(self, user: User) -> None:
         self.query("INSERT INTO users(google_sub,email,name,created_at,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT(google_sub) DO UPDATE SET email=excluded.email,name=excluded.name,updated_at=CURRENT_TIMESTAMP", [user.google_sub, user.email.lower(), user.name])
 
-    def provision(self, user: User) -> dict[str, Any]:
-        self.user(user); existing = self.query("SELECT tenant_id FROM tenants WHERE owner_google_sub=?", [user.google_sub])
-        if existing: return {"tenant_id": existing[0]["tenant_id"], "created": False}
-        tenant_id = f"tenant_{uuid4().hex}"; self.query("INSERT INTO tenants(tenant_id,owner_google_sub,created_at) VALUES(?,?,CURRENT_TIMESTAMP)", [tenant_id, user.google_sub]); self.query("INSERT INTO tenant_members(tenant_id,google_sub,role,joined_at) VALUES(?,?, 'owner', CURRENT_TIMESTAMP)", [tenant_id, user.google_sub]); return {"tenant_id": tenant_id, "created": True}
+    def tenant_id_for_name(self, name: str) -> str:
+        normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower().strip()
+        tenant_id = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+        if not 3 <= len(tenant_id) <= 48:
+            raise ValueError("Tenant name must produce an identifier between 3 and 48 characters")
+        return tenant_id
+
+    def tenant_available(self, name: str) -> dict[str, Any]:
+        tenant_id = self.tenant_id_for_name(name)
+        rows = self.query("SELECT 1 FROM tenants WHERE tenant_id=?", [tenant_id])
+        return {"tenant_id": tenant_id, "available": not bool(rows)}
+
+    def provision(self, user: User, name: str) -> dict[str, Any]:
+        display_name = name.strip()
+        if not 3 <= len(display_name) <= 80:
+            raise ValueError("Tenant name must be between 3 and 80 characters")
+        tenant_id = self.tenant_id_for_name(display_name)
+        if self.query("SELECT 1 FROM tenants WHERE tenant_id=?", [tenant_id]):
+            raise ValueError("That tenant name is already in use")
+        self.user(user)
+        self.query("INSERT INTO tenants(tenant_id,display_name,owner_google_sub,created_at) VALUES(?,?,?,CURRENT_TIMESTAMP)", [tenant_id, display_name, user.google_sub])
+        self.query("INSERT INTO tenant_members(tenant_id,google_sub,role,joined_at) VALUES(?,?, 'owner', CURRENT_TIMESTAMP)", [tenant_id, user.google_sub])
+        return {"tenant_id": tenant_id, "display_name": display_name, "created": True}
 
     def tenants_for(self, user: User) -> list[dict[str, Any]]:
-        self.user(user); return self.query("SELECT t.tenant_id, m.role, t.owner_google_sub FROM tenants t JOIN tenant_members m ON m.tenant_id=t.tenant_id WHERE m.google_sub=? ORDER BY t.created_at", [user.google_sub])
+        self.user(user); return self.query("SELECT t.tenant_id, t.display_name, m.role, t.owner_google_sub FROM tenants t JOIN tenant_members m ON m.tenant_id=t.tenant_id WHERE m.google_sub=? ORDER BY t.created_at", [user.google_sub])
     def role_for(self, user: User, tenant_id: str) -> str | None:
         rows = self.query("SELECT role FROM tenant_members WHERE tenant_id=? AND google_sub=?", [tenant_id, user.google_sub]); return rows[0]["role"] if rows else None
     def invite(self, owner: User, tenant_id: str, email: str) -> dict[str, Any]:
