@@ -8,7 +8,7 @@
     "LIBRARIAN_THINKING_LEVEL": "minimal",
     "LIBRARIAN_PROVIDER_ORDER": "google,vertex",
     "LIBRARIAN_FALLBACK_MODEL": "",
-    "LIBRARIAN_API_BASE_URL": "http://127.0.0.1:8000" // For local development, must be changed once deployed
+    "LIBRARIAN_API_BASE_URL": "https://meetpulse-wiki.vercel.app"
   },
   "r2_buckets": [
     { "binding": "WIKI_BUCKET", "bucket_name": "meetpulse-wiki", "remote": true }
