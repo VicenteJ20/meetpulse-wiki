@@ -32,11 +32,40 @@ Antes del primer despliegue, aplica las migraciones de `migrations/` en Cloudfla
 - `GET /api/v1/dashboard/{tenant_id}/clients/{client_id}/projects`: proyectos del cliente y sus contadores.
 - `GET /api/v1/dashboard/{tenant_id}/activity?limit=20`: eventos de ingesta listos para una vista de actividad.
 - `GET /api/v1/wiki/{tenant_id}/documents?client_id=&project_id=`: documentos disponibles dentro del alcance seleccionado.
-- `GET /api/v1/wiki/{tenant_id}/documents/{document}?client_id=&project_id=`: contenido Markdown de un documento permitido (`index`, `acuerdos`, `arquitectura`, `conceptos`, `participantes`, `riesgos`).
+- `GET /api/v1/wiki/{tenant_id}/documents/{document}?client_id=&project_id=`: contenido Markdown de una fuente de análisis o del contexto de proyecto.
+- `PUT /api/v1/wiki/{tenant_id}/documents/context?client_id=&project_id=`: actualiza el contexto con un documento OKF completo en `content_markdown`.
 
 Una ingesta se guarda en `sources/{tenant}/{client}/{project}/{fecha-utc}-{titulo-slug}.md`. Una colisión de ruta devuelve `409` y nunca reemplaza la fuente. El YAML del archivo se conserva, salvo los seis metadatos canónicos que son reemplazados con los campos del formulario.
 
 No se exponen aún `/query` ni `/lint`; ambos requieren la fase posterior de IA/mantenimiento.
+
+## Estructura y contrato OKF
+
+R2 separa las fuentes crudas e inmutables de la Wiki derivada:
+
+```text
+sources/{tenant_id}/{client_id}/{project_id}/{YYYY-MM-DD}-{titulo-slug}.md
+wiki/{tenant_id}/index.md
+wiki/{tenant_id}/log.md
+wiki/{tenant_id}/{client_id}/index.md
+wiki/{tenant_id}/{client_id}/{project_id}/index.md
+wiki/{tenant_id}/{client_id}/{project_id}/context.md
+```
+
+`index.md` y `log.md` son artefactos internos que la API genera y mantiene; no son documentos OKF. Todo documento de conocimiento bajo `wiki/` debe incluir YAML frontmatter con este contrato:
+
+```yaml
+---
+type: context # context | meeting | decision | risk
+title: Project context
+description: Current global state of the project.
+sources:
+  - sources/acme/client/project/2026-07-12-design-meeting.md
+timestamp: 2026-07-12T19:30:00Z
+---
+```
+
+Los campos son obligatorios. `sources` debe contener claves existentes, sin duplicados, dentro del mismo tenant, cliente y proyecto; los IDs de la ruta no se repiten en el YAML. En esta fase solo se expone la edición de `context`; `meeting`, `decision` y `risk` quedan reservados para el pipeline de IA posterior.
 
 ## Prueba real contra R2
 

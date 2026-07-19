@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-from app.content import append_link, build_source_markdown, client_index, log_header, markdown_links, project_index, slugify, split_front_matter, tenant_index
+from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, project_index, slugify, split_front_matter, tenant_index, validate_okf_document
 from app.storage import ObjectNotFound, ObjectStorage, PreconditionFailed, StorageError
 
 
@@ -31,8 +31,15 @@ class WikiService:
         self._ensure(tenant_key, tenant_index(tenant_id), created_or_updated)
         self._ensure(client_key, client_index(client_id), created_or_updated)
         self._ensure(project_key, project_index(project_id), created_or_updated)
-        # Empty Markdown, intentionally separate from an immutable meeting analysis.
-        self._ensure(context_key, "", created_or_updated)
+        initial_context = build_okf_document(
+            document_type="context",
+            title="Project context",
+            description="Current global state of the project.",
+            sources=[source_key],
+            timestamp=datetime.now(UTC),
+        )
+        self._validate_wiki_document(initial_context, tenant_id, client_id, project_id, required_type="context")
+        self._ensure(context_key, initial_context, created_or_updated)
         self._ensure(log_key, log_header(tenant_id), created_or_updated)
         self._update(tenant_key, lambda text: append_link(text, client_id, f"{client_id}/index.md"), created_or_updated)
         self._update(client_key, lambda text: append_link(text, project_id, f"{project_id}/index.md"), created_or_updated)
@@ -123,6 +130,7 @@ class WikiService:
 
     def update_context(self, tenant_id: str, client_id: str, project_id: str, content_markdown: str) -> dict[str, object]:
         key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"
+        self._validate_wiki_document(content_markdown, tenant_id, client_id, project_id, required_type="context")
         for _ in range(5):
             current = self.storage.get_text(key)
             try:
@@ -160,6 +168,20 @@ class WikiService:
     @staticmethod
     def _last_activity(entries: list[dict[str, str]], client_id: str, project_id: str | None = None) -> str | None:
         return next((entry["timestamp"] for entry in entries if entry["client_id"] == client_id and (project_id is None or entry["project_id"] == project_id)), None)
+
+    def _validate_wiki_document(self, markdown: str, tenant_id: str, client_id: str, project_id: str, *, required_type: str | None = None) -> None:
+        metadata = validate_okf_document(
+            markdown,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            project_id=project_id,
+            required_type=required_type,
+        )
+        for source_key in metadata["sources"]:
+            try:
+                self.storage.get_text(source_key)
+            except ObjectNotFound as exc:
+                raise ValueError(f"OKF source does not exist: {source_key}") from exc
 
     def _ensure(self, key: str, text: str, changed: list[str]) -> None:
         try: self.storage.put_if_absent(key, text); changed.append(key)

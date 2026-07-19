@@ -76,6 +76,18 @@ def ingest(client: TestClient, **extra: object):
     )
 
 
+def context_markdown(source_key: str, **overrides: str) -> str:
+    metadata = {
+        "type": "context",
+        "title": "Project context",
+        "description": "Current state after the design meeting.",
+        "sources": f"- {source_key}",
+        "timestamp": "2026-07-12T19:30:00Z",
+    }
+    metadata.update(overrides)
+    return "---\n" + "\n".join(f"{key}: {value}" for key, value in metadata.items()) + "\n---\n\n# Extra context\n"
+
+
 def test_ingest_creates_source_wiki_and_log() -> None:
     client, storage = api()
     response = ingest(client)
@@ -88,9 +100,14 @@ def test_ingest_creates_source_wiki_and_log() -> None:
     assert "title: old" not in source
     assert "# Notes" in source
     assert "wiki/tenant_1/client-1/project_1/context.md" in storage.objects
+    context, _ = storage.objects["wiki/tenant_1/client-1/project_1/context.md"]
+    assert "type: context" in context
+    assert f"- {source_key}" in context
     assert not any(key.endswith(("acuerdos.md", "arquitectura.md", "conceptos.md", "participantes.md", "riesgos.md")) for key in storage.objects)
     assert source_key in storage.objects["wiki/tenant_1/client-1/project_1/index.md"][0]
     assert "ingest:" in storage.objects["wiki/tenant_1/log.md"][0]
+    assert not storage.objects["wiki/tenant_1/index.md"][0].startswith("---")
+    assert not storage.objects["wiki/tenant_1/log.md"][0].startswith("---")
 
 
 def test_ingest_collision_is_immutable() -> None:
@@ -154,7 +171,42 @@ def test_dashboard_and_wiki_document_reading() -> None:
     assert read.status_code == 200
     assert read.json()["content_markdown"].startswith("# Notes")
     assert "tenant_id:" not in read.json()["content_markdown"]
-    context = client.put("/api/v1/wiki/tenant_1/documents/context", params={"client_id": "client-1", "project_id": "project_1"}, json={"content_markdown": "# Extra context\n"})
+    source_key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"
+    expected_context = context_markdown(source_key)
+    context = client.put("/api/v1/wiki/tenant_1/documents/context", params={"client_id": "client-1", "project_id": "project_1"}, json={"content_markdown": expected_context})
     assert context.status_code == 200
-    assert context.json()["content_markdown"] == "# Extra context\n"
+    assert context.json()["content_markdown"] == expected_context
     assert client.get("/api/v1/wiki/tenant_1/documents/unknown", params={"client_id": "client-1", "project_id": "project_1"}).status_code == 422
+
+
+def test_context_okf_validation_and_source_traceability() -> None:
+    client, _ = api()
+    assert ingest(client).status_code == 201
+    endpoint = "/api/v1/wiki/tenant_1/documents/context"
+    params = {"client_id": "client-1", "project_id": "project_1"}
+    source_key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"
+
+    invalid_documents = [
+        "# no front matter\n",
+        "---\ntype: context\n",
+        context_markdown(source_key, type="unknown"),
+        context_markdown(source_key, title=""),
+        context_markdown(source_key, timestamp="2026-07-12T19:30:00-04:00"),
+        context_markdown(source_key, sources="[]"),
+        context_markdown(source_key, sources=f"- {source_key}\n- {source_key}"),
+        context_markdown("sources/tenant_1/client-1/other-project/missing.md"),
+        context_markdown("sources/tenant_1/client-1/project_1/missing.md"),
+        context_markdown(source_key, tenant_id="tenant_1"),
+    ]
+    for document in invalid_documents:
+        response = client.put(endpoint, params=params, json={"content_markdown": document})
+        assert response.status_code == 422, response.text
+
+
+def test_second_ingest_does_not_replace_initial_context() -> None:
+    client, storage = api()
+    assert ingest(client).status_code == 201
+    context_key = "wiki/tenant_1/client-1/project_1/context.md"
+    original_context = storage.objects[context_key]
+    assert ingest(client, title="Second meeting").status_code == 201
+    assert storage.objects[context_key] == original_context

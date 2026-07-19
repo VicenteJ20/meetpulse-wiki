@@ -203,6 +203,8 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
         client_id, project_id = identifier(client_id, "client_id"), identifier(project_id, "project_id")
         try:
             return service(request).update_context(tenant_id, client_id, project_id, content_markdown)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ObjectNotFound as exc:
             raise HTTPException(status_code=404, detail={"key": str(exc)}) from exc
         except StorageError as exc:
