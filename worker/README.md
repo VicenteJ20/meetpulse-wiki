@@ -44,9 +44,13 @@ Para consumir R2 y D1 remotos con una Queue local, conserva `remote: true` en am
 
 ```env
 LIBRARIAN_DEV_MODE=true
+LIBRARIAN_API_BASE_URL=http://127.0.0.1:8000
 AI_GATEWAY_API_KEY=
 LIBRARIAN_WEBHOOK_SECRET=
 ```
+
+`LIBRARIAN_API_BASE_URL` en `.dev.vars` sobrescribe la URL productiva de
+`wrangler.jsonc`; así el Worker local aplica los resultados contra la API local.
 
 Con la API activa en `http://127.0.0.1:8000`, inicia el Worker:
 
