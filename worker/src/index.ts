@@ -23,7 +23,11 @@ interface MaintenanceMessage { kind: "maintenance"; tenant_id: string }
 interface EntityDraft {
   title: string;
   description: string;
-  body: string;
+  statement: string;
+  project_impact: string;
+  next_step: string;
+  evidence_section: string;
+  evidence_summary: string;
   supersedes: string[];
   related: string[];
 }
@@ -54,9 +58,11 @@ const ANALYSIS_SCHEMA = {
 function entitySchema() {
   return {
     type: "object", additionalProperties: false,
-    required: ["title", "description", "body", "supersedes", "related"],
+    required: ["title", "description", "statement", "project_impact", "next_step", "evidence_section", "evidence_summary", "supersedes", "related"],
     properties: {
-      title: { type: "string" }, description: { type: "string" }, body: { type: "string" },
+      title: { type: "string" }, description: { type: "string" }, statement: { type: "string" },
+      project_impact: { type: "string" }, next_step: { type: "string" },
+      evidence_section: { type: "string" }, evidence_summary: { type: "string" },
       supersedes: { type: "array", items: { type: "string" } },
       related: { type: "array", items: { type: "string" } },
     },
@@ -149,14 +155,15 @@ async function processSource(event: R2Notification, deliveryAttempts: number, en
 
     let analysis: AnalysisResult;
     let usage = { input_tokens: 0, output_tokens: 0, latency_ms: 0 };
-    const persisted = job?.analysis_payload;
-    if (persisted) analysis = JSON.parse(persisted) as AnalysisResult;
+    const persisted = job?.analysis_payload ? JSON.parse(job.analysis_payload) as AnalysisResult : null;
+    const reusablePayload = persisted && usesCurrentEntitySchema(persisted);
+    if (reusablePayload) analysis = persisted;
     else {
       const result = await analyzeMeeting(compactAnalysis(sourceText), contextText, catalog, env);
       analysis = result.analysis; usage = result.usage;
     }
     analysis = normalizeAnalysis(analysis);
-    if (!persisted) {
+    if (!reusablePayload) {
       await env.DB.prepare(
         "UPDATE librarian_jobs SET analysis_payload=?,model=?,thinking_level=?,input_tokens=?,output_tokens=?,latency_ms=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
       ).bind(JSON.stringify(analysis), env.LIBRARIAN_MODEL, env.LIBRARIAN_THINKING_LEVEL, usage.input_tokens, usage.output_tokens, usage.latency_ms, jobId).run();
@@ -169,8 +176,8 @@ async function processSource(event: R2Notification, deliveryAttempts: number, en
       source_key: event.object.key, expected_context_etag: contextObject.etag,
       context: { ...analysis.context, sources: contextSources, timestamp },
       documents: [
-        ...analysis.decisions.map((item) => ({ ...item, type: "decision", timestamp })),
-        ...analysis.risks.map((item) => ({ ...item, type: "risk", timestamp })),
+        ...analysis.decisions.map((item) => renderEntity(item, "decision", timestamp)),
+        ...analysis.risks.map((item) => renderEntity(item, "risk", timestamp)),
       ],
     };
     const response = await signedPost("/api/v1/internal/librarian/apply", applyPayload, env);
@@ -230,9 +237,15 @@ function librarianPrompt(): string {
     "Reescribe el contexto completo usando exactamente # Estado actual, ## Hitos y ## Pendientes; cada encabezado debe ocupar su propia lÃ­nea, sin dos puntos ni contenido en esa lÃ­nea.",
     "Conserva información anterior salvo que la nueva reunión la contradiga explícitamente.",
     "Una decisión requiere un acuerdo formal que cambie rumbo, alcance, arquitectura o negocio.",
+    "Debe ser un acuerdo explícito tomado por participantes responsables de ESTE proyecto.",
+    "Acciones, anuncios o decisiones de gobiernos, empresas u otros terceros que la reunión solo comenta son contexto, nunca decisiones del proyecto.",
     "Si el análisis dice que no hubo decisiones, decisions debe ser [].",
     "Compromisos, tareas y puntos sin resolver van a Pendientes, no a decisions.",
     "Solo crea un risk si hay impacto, bloqueo, amenaza o probabilidad adversa explícita.",
+    "Ese impacto debe estar vinculado explícitamente con ESTE proyecto; riesgos de terceros tratados como noticia o análisis de mercado no son risks del proyecto.",
+    "Una reunión informativa normalmente produce decisions=[] y risks=[]. No crees archivos atómicos solo para aumentar cobertura.",
+    "Cada entidad atómica debe explicar enunciado, impacto en el proyecto, siguiente paso y sección concreta de evidencia. Usa descripciones breves y autosuficientes.",
+    "El contexto representa el estado del proyecto que usa esta Wiki; no adoptes la voz ni los objetivos de una organización externa.",
     "No inventes fechas, responsables, decisiones, riesgos, relaciones ni hechos.",
     "supersedes y related solo pueden usar claves exactas presentes en el catálogo.",
   ].join("\n");
@@ -272,8 +285,31 @@ function validateAnalysis(value: AnalysisResult): void {
   if (!value || typeof value !== "object" || !value.context || !Array.isArray(value.decisions) || !Array.isArray(value.risks)) throw new Error("invalid_analysis_shape");
   if (!/^# Estado actual\s*$/mi.test(value.context.body) || !/^## Hitos\s*$/mi.test(value.context.body) || !/^## Pendientes\s*$/mi.test(value.context.body)) throw new Error("invalid_context_sections");
   for (const item of [...value.decisions, ...value.risks]) {
-    if (!item.title?.trim() || !item.description?.trim() || !item.body?.trim() || !Array.isArray(item.supersedes) || !Array.isArray(item.related)) throw new Error("invalid_entity_shape");
+    const fields = [item.title, item.description, item.statement, item.project_impact, item.next_step, item.evidence_section, item.evidence_summary];
+    if (fields.some((field) => typeof field !== "string" || !field.trim()) || !Array.isArray(item.supersedes) || !Array.isArray(item.related)) throw new Error("invalid_entity_shape");
   }
+}
+
+function usesCurrentEntitySchema(value: AnalysisResult): boolean {
+  if (!value || !Array.isArray(value.decisions) || !Array.isArray(value.risks)) return false;
+  return [...value.decisions, ...value.risks].every((item) =>
+    [item.statement, item.project_impact, item.next_step, item.evidence_section, item.evidence_summary]
+      .every((field) => typeof field === "string" && field.trim().length > 0),
+  );
+}
+
+function renderEntity(item: EntityDraft, type: "decision" | "risk", timestamp: string) {
+  const heading = type === "decision" ? "Decisión" : "Riesgo";
+  const responseHeading = type === "decision" ? "Próximo paso" : "Respuesta";
+  const body = [
+    `# ${heading}`, "", item.statement.trim(), "", "## Impacto en el proyecto", "", item.project_impact.trim(), "",
+    `## ${responseHeading}`, "", item.next_step.trim(), "", "## Evidencia", "",
+    `**Sección de origen:** ${item.evidence_section.trim()}`, "", item.evidence_summary.trim(), "",
+  ].join("\n");
+  return {
+    type, title: item.title.trim(), description: item.description.trim(), body, timestamp,
+    supersedes: item.supersedes, related: item.related,
+  };
 }
 
 function normalizeAnalysis(value: AnalysisResult): AnalysisResult {

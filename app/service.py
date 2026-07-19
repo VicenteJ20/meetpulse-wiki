@@ -201,12 +201,13 @@ class WikiService:
         for key in sorted(self.storage.list_keys(source_prefix), reverse=True):
             if key.endswith(".md"):
                 obj = self.storage.get_text(key)
-                metadata, _ = parse_front_matter(obj.text)
+                metadata, body = parse_front_matter(obj.text)
                 stem = key.rsplit("/", 1)[-1].removesuffix(".md")
                 raw_sources = metadata.get("raw_sources") if isinstance(metadata.get("raw_sources"), list) else []
                 items.append({
                     "document": f"analysis:{stem}", "title": metadata.get("title") or self._analysis_title(stem),
                     "key": key, "updated_at": self._updated_at(obj), "type": "meeting",
+                    "description": metadata.get("description") or self._markdown_snippet(body),
                     "source_kind": metadata.get("source_kind", "meeting_analysis"),
                     "provenance_status": metadata.get("provenance_status", "analysis_only"),
                     "raw_available": bool(raw_sources),
@@ -214,7 +215,12 @@ class WikiService:
         context_key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"
         try:
             context = self.storage.get_text(context_key)
-            items.append({"document": "context", "title": "Project context", "key": context_key, "updated_at": self._updated_at(context), "type": "context"})
+            context_metadata, _ = parse_front_matter(context.text)
+            items.append({
+                "document": "context", "title": context_metadata.get("title") or "Project context",
+                "description": context_metadata.get("description"), "key": context_key,
+                "updated_at": self._updated_at(context), "type": "context",
+            })
         except ObjectNotFound:
             pass
         project_prefix = f"wiki/{tenant_id}/{client_id}/{project_id}"
@@ -253,11 +259,16 @@ class WikiService:
         else:
             raise ValueError("document must be a project context, meeting analysis, decision, or risk")
         obj = self.storage.get_text(key)
-        metadata, _ = parse_front_matter(obj.text)
-        response = {"document": document, "title": metadata.get("title") or title, "key": key, "content_markdown": split_front_matter(obj.text)[1] if is_analysis else obj.text, "content_type": "text/markdown", "updated_at": self._updated_at(obj)}
+        metadata, body = parse_front_matter(obj.text)
+        response = {
+            "document": document, "title": metadata.get("title") or title, "description": metadata.get("description"),
+            "key": key, "content_markdown": body if is_analysis else obj.text, "body_markdown": body,
+            "metadata": metadata, "type": "meeting" if is_analysis else metadata.get("type"),
+            "content_type": "text/markdown", "updated_at": self._updated_at(obj),
+        }
         if is_analysis:
             raw_sources = metadata.get("raw_sources") if isinstance(metadata.get("raw_sources"), list) else []
-            response.update({"type": "meeting", "source_kind": metadata.get("source_kind", "meeting_analysis"), "provenance_status": metadata.get("provenance_status", "analysis_only"), "raw_available": bool(raw_sources)})
+            response.update({"source_kind": metadata.get("source_kind", "meeting_analysis"), "provenance_status": metadata.get("provenance_status", "analysis_only"), "raw_available": bool(raw_sources)})
         return response
 
     def update_context(self, tenant_id: str, client_id: str, project_id: str, content_markdown: str) -> dict[str, object]:
@@ -268,7 +279,13 @@ class WikiService:
             try:
                 self.storage.put_if_match(key, content_markdown, current.etag)
                 saved = self.storage.get_text(key)
-                return {"document": "context", "title": "Project context", "key": key, "content_markdown": saved.text, "content_type": "text/markdown", "updated_at": self._updated_at(saved)}
+                metadata, body = parse_front_matter(saved.text)
+                return {
+                    "document": "context", "title": metadata.get("title") or "Project context",
+                    "description": metadata.get("description"), "key": key, "content_markdown": saved.text,
+                    "body_markdown": body, "metadata": metadata, "type": "context",
+                    "content_type": "text/markdown", "updated_at": self._updated_at(saved),
+                }
             except PreconditionFailed:
                 continue
         raise StorageError("context update conflicted repeatedly")
@@ -567,6 +584,20 @@ class WikiService:
                 self.storage.get_text(source_key)
             except ObjectNotFound as exc:
                 raise ValueError(f"OKF source does not exist: {source_key}") from exc
+
+    @staticmethod
+    def _markdown_snippet(markdown: str, limit: int = 180) -> str:
+        for paragraph in re.split(r"\n\s*\n", markdown):
+            lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+            if not lines or all(line.startswith(("#", "|", "-", "*", "[")) for line in lines):
+                continue
+            text = " ".join(lines)
+            text = re.sub(r"[`*_>#]", "", text)
+            text = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+        return "Reunión analizada del proyecto."
 
     def _ensure(self, key: str, text: str, changed: list[str]) -> None:
         try: self.storage.put_if_absent(key, text); changed.append(key)

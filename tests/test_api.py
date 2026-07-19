@@ -217,7 +217,13 @@ def test_dashboard_and_document_reading() -> None:
     assert {item["document"] for item in documents} == {"analysis:2026-07-12-reunion-de-diseno", "context"}
     read = client.get("/api/v1/wiki/tenant_1/documents/analysis:2026-07-12-reunion-de-diseno", params={"client_id": "client-1", "project_id": "project_1"})
     assert read.status_code == 200 and read.json()["content_markdown"].startswith("## Contexto y Estado Actual")
+    assert read.json()["body_markdown"] == read.json()["content_markdown"]
     assert read.json()["type"] == "meeting" and read.json()["source_kind"] == "meeting_analysis" and read.json()["raw_available"] is False
+
+    context = client.get("/api/v1/wiki/tenant_1/documents/context", params={"client_id": "client-1", "project_id": "project_1"}).json()
+    assert context["content_markdown"].startswith("---\n")
+    assert context["body_markdown"] == ""
+    assert context["metadata"]["type"] == "context"
 
 
 def test_context_okf_validation_and_update() -> None:
@@ -225,7 +231,8 @@ def test_context_okf_validation_and_update() -> None:
     endpoint = "/api/v1/wiki/tenant_1/documents/context"; params = {"client_id": "client-1", "project_id": "project_1"}
     source_key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"
     expected = context_markdown(source_key)
-    assert client.put(endpoint, params=params, json={"content_markdown": expected}).json()["content_markdown"] == expected
+    updated = client.put(endpoint, params=params, json={"content_markdown": expected}).json()
+    assert updated["content_markdown"] == expected and updated["body_markdown"] == "# Extra context\n"
     invalid = ["# no front matter\n", "---\ntype: context\n", context_markdown(source_key, type="unknown"), context_markdown(source_key, sources="[]"), context_markdown(source_key, timestamp="2026-07-12T19:30:00-04:00"), context_markdown("sources/tenant_1/client-1/project_1/missing.md")]
     for document in invalid: assert client.put(endpoint, params=params, json={"content_markdown": document}).status_code == 422
 
