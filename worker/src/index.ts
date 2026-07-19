@@ -254,7 +254,9 @@ function librarianPrompt(): string {
 function compactAnalysis(markdown: string): string {
   const body = markdown.replace(/^---\s*\n[\s\S]*?\n---\s*\n/, "");
   const aliases = /objetivo|contexto|estado|tema|decision|compromiso|proximo|riesgo|resolver|objective|context|state|topic|decision|commitment|next step|risk|unresolved/i;
-  const sections = body.split(/(?=^#{2,3}\s+)/m).filter((section) => aliases.test(section.split("\n", 1)[0] ?? ""));
+  // Select complete level-two sections. Splitting on level-three headings used
+  // to discard the actual entities nested below "Decisiones" and "Riesgos".
+  const sections = body.split(/(?=^##\s+)/m).filter((section) => aliases.test(section.split("\n", 1)[0] ?? ""));
   return sections.join("\n\n").slice(0, 120_000);
 }
 
