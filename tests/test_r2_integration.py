@@ -33,7 +33,7 @@ def tenant_id(r2_storage: R2Storage):
     tenant = f"r2test{uuid.uuid4().hex[:12]}"
     yield tenant
     # Cleanup remains strictly inside the random test tenant namespace.
-    prefixes = (f"sources/{tenant}/", f"wiki/{tenant}/")
+    prefixes = (f"raw/{tenant}/", f"sources/{tenant}/", f"wiki/{tenant}/")
     for prefix in prefixes:
         keys = r2_storage.list_keys(prefix)
         if keys:
@@ -63,7 +63,11 @@ def test_real_r2_ingest_tree_logs_and_collision(api_client, r2_storage: R2Storag
         "date_time": "2026-07-12T15:30:00-04:00",
         "participants": ["MeetPulse QA", "R2"],
     }
-    files = {"file": ("analysis.md", "---\nsource: integration-test\n---\n\n## Contexto y Estado Actual\n\nPrueba real.\n\n## Decisiones Tomadas\n\nNo se tomaron decisiones.\n", "text/markdown")}
+    analysis = "---\nsource: integration-test\n---\n\n## Contexto y Estado Actual\n\nPrueba real.\n\n## Decisiones Tomadas\n\nNo se tomaron decisiones.\n"
+    files = {
+        "file": ("analysis.md", analysis, "text/markdown"),
+        "raw_file": ("transcript.md", "# Transcript\n\nPrueba real sin transformar.\n", "text/markdown"),
+    }
 
     created = api_client.post("/api/v1/ingest", data=data, files=files)
     assert created.status_code == 201, created.text
@@ -108,5 +112,13 @@ def test_real_r2_ingest_tree_logs_and_collision(api_client, r2_storage: R2Storag
     assert document.status_code == 200, document.text
     assert document.json()["content_markdown"].startswith("## Contexto y Estado Actual")
 
-    collision = api_client.post("/api/v1/ingest", data=data, files=files)
+    identical = api_client.post("/api/v1/ingest", data=data, files=files)
+    assert identical.status_code == 201, identical.text
+    assert identical.json()["ingest_status"] == "unchanged"
+
+    changed_files = {
+        "file": ("analysis.md", analysis.replace("Prueba real.", "Contenido diferente."), "text/markdown"),
+        "raw_file": files["raw_file"],
+    }
+    collision = api_client.post("/api/v1/ingest", data=data, files=changed_files)
     assert collision.status_code == 409, collision.text

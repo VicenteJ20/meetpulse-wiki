@@ -37,12 +37,40 @@ class WikiService:
         validate_meeting_analysis(markdown)
         date_utc = date_time.replace(tzinfo=UTC) if date_time.tzinfo is None else date_time.astimezone(UTC)
         source_key = f"sources/{tenant_id}/{client_id}/{project_id}/{date_utc:%Y-%m-%d}-{slugify(title)}.md"
+        existing_source = None
+        try:
+            existing_source = self.storage.get_text(source_key)
+        except ObjectNotFound:
+            pass
+
+        analysis_only_content = build_source_markdown(
+            markdown,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            project_id=project_id,
+            title=title,
+            date_time=date_time,
+            participants=participants,
+            raw_keys=[],
+            raw_hashes=[],
+        )
+        if existing_source is not None and not self._same_source_analysis(existing_source.text, analysis_only_content):
+            raise SourceAlreadyExists(source_key)
+
         raw_keys: list[str] = []
         raw_hashes: list[str] = []
         if raw_data is not None and raw_filename:
-            filename = self._safe_raw_filename(raw_filename)
-            raw_key = f"raw/{tenant_id}/{client_id}/{project_id}/{date_utc:%Y-%m-%d}-{slugify(title)}/{filename}"
             raw_hash = sha256(raw_data).hexdigest()
+            existing_metadata = parse_front_matter(existing_source.text)[0] if existing_source is not None else {}
+            existing_raw_keys = existing_metadata.get("raw_sources")
+            existing_raw_hashes = existing_metadata.get("raw_sha256")
+            if isinstance(existing_raw_keys, list) and existing_raw_keys:
+                if not isinstance(existing_raw_hashes, list) or raw_hash not in existing_raw_hashes:
+                    raise SourceAlreadyExists(source_key)
+                raw_key = str(existing_raw_keys[existing_raw_hashes.index(raw_hash)])
+            else:
+                filename = self._safe_raw_filename(raw_filename)
+                raw_key = f"raw/{tenant_id}/{client_id}/{project_id}/{date_utc:%Y-%m-%d}-{slugify(title)}/{filename}"
             try:
                 self.storage.put_bytes_if_absent(raw_key, raw_data, content_type=raw_content_type, sha256_hex=raw_hash)
             except PreconditionFailed:
@@ -51,6 +79,13 @@ class WikiService:
                     raise SourceAlreadyExists(raw_key)
             raw_keys.append(raw_key)
             raw_hashes.append(raw_hash)
+        elif existing_source is not None:
+            existing_metadata = parse_front_matter(existing_source.text)[0]
+            existing_raw_keys = existing_metadata.get("raw_sources")
+            existing_raw_hashes = existing_metadata.get("raw_sha256")
+            if isinstance(existing_raw_keys, list) and isinstance(existing_raw_hashes, list):
+                raw_keys = [str(key) for key in existing_raw_keys]
+                raw_hashes = [str(value) for value in existing_raw_hashes]
         content = build_source_markdown(
             markdown,
             tenant_id=tenant_id,
@@ -62,15 +97,25 @@ class WikiService:
             raw_keys=raw_keys,
             raw_hashes=raw_hashes,
         )
-        try:
-            self.storage.put_if_absent(source_key, content)
-        except PreconditionFailed as exc:
-            raise SourceAlreadyExists(source_key) from exc
+        source_action = "created"
+        if existing_source is None:
+            try:
+                self.storage.put_if_absent(source_key, content)
+            except PreconditionFailed as exc:
+                raise SourceAlreadyExists(source_key) from exc
+        elif existing_source.text == content:
+            source_action = "unchanged"
+        else:
+            try:
+                self.storage.put_if_match(source_key, content, existing_source.etag)
+                source_action = "reconciled"
+            except PreconditionFailed as exc:
+                raise SourceAlreadyExists(source_key) from exc
 
         project_prefix = f"wiki/{tenant_id}/{client_id}/{project_id}"
         tenant_key, client_key, project_key = f"wiki/{tenant_id}/index.md", f"wiki/{tenant_id}/{client_id}/index.md", f"{project_prefix}/index.md"
         context_key, log_key = f"{project_prefix}/context.md", f"wiki/{tenant_id}/log.md"
-        created_or_updated = [source_key]
+        created_or_updated = [] if source_action == "unchanged" else [source_key]
         self._ensure(tenant_key, tenant_index(tenant_id), created_or_updated)
         self._ensure(client_key, client_index(client_id), created_or_updated)
         self._ensure(project_key, project_index(project_id), created_or_updated)
@@ -87,13 +132,16 @@ class WikiService:
         self._update(tenant_key, lambda text: append_link(text, client_id, f"{client_id}/index.md"), created_or_updated)
         self._update(client_key, lambda text: append_link(text, project_id, f"{project_id}/index.md"), created_or_updated)
         self._update(project_key, lambda text: append_link(text, title, f"/{source_key}"), created_or_updated)
-        timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        event = f"- `{timestamp}` ingest: `/{source_key}` (client={client_id}, project={project_id}; wiki={', '.join(f'`/{key}`' for key in created_or_updated if key != source_key)})"
-        self._update(log_key, lambda text: text.rstrip() + "\n" + event + "\n", created_or_updated)
+        if source_action != "unchanged":
+            timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            operation = "ingest" if source_action == "created" else "provenance"
+            event = f"- `{timestamp}` {operation}: `/{source_key}` (client={client_id}, project={project_id}; wiki={', '.join(f'`/{key}`' for key in created_or_updated if key != source_key)})"
+            self._update(log_key, lambda text: text.rstrip() + "\n" + event + "\n", created_or_updated)
         return {
             "source_key": source_key,
             "raw_key": raw_keys[0] if raw_keys else None,
             "provenance_status": "complete" if raw_keys else "analysis_only",
+            "ingest_status": source_action,
             "updated_keys": created_or_updated,
         }
 
@@ -368,6 +416,17 @@ class WikiService:
         if extension.lower() not in {"md", "txt"}:
             raise ValueError("raw_file must be a UTF-8 .md or .txt file")
         return f"{slugify(stem)}.{extension.lower()}"
+
+    @staticmethod
+    def _same_source_analysis(existing: str, expected_analysis_only: str) -> bool:
+        existing_metadata, existing_body = parse_front_matter(existing)
+        expected_metadata, expected_body = parse_front_matter(expected_analysis_only)
+        managed_fields = {
+            "source_kind", "analysis_schema_version", "raw_sources", "raw_sha256", "provenance_status",
+        }
+        existing_base = {key: value for key, value in existing_metadata.items() if key not in managed_fields}
+        expected_base = {key: value for key, value in expected_metadata.items() if key not in managed_fields}
+        return existing_base == expected_base and existing_body == expected_body
 
     @staticmethod
     def _required_text(value: dict[str, object], field: str) -> str:

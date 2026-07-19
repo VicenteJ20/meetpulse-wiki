@@ -115,7 +115,8 @@ def test_ingest_creates_analysis_wiki_job_and_log() -> None:
     source_key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"
     assert response.json() | {"updated_keys": response.json()["updated_keys"]} == {
         "source_key": source_key, "raw_key": None, "provenance_status": "analysis_only",
-        "job_id": job_id_for_source(source_key), "processing_status": "pending", "updated_keys": response.json()["updated_keys"],
+        "ingest_status": "created", "job_id": job_id_for_source(source_key),
+        "processing_status": "pending", "updated_keys": response.json()["updated_keys"],
     }
     source = storage.objects[source_key][0]
     assert "custom: preserve" in source and "title: Reunión de diseño" in source and "title: old" not in source
@@ -126,10 +127,59 @@ def test_ingest_creates_analysis_wiki_job_and_log() -> None:
     assert "ingest:" in storage.objects["wiki/tenant_1/log.md"][0]
 
 
-def test_ingest_collision_is_immutable() -> None:
+def test_identical_ingest_is_idempotent_but_changed_analysis_conflicts() -> None:
     client, storage = api(); assert ingest(client).status_code == 201
-    key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"; original = storage.objects[key]
-    assert ingest(client).status_code == 409 and storage.objects[key] == original
+    key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"
+    original_source, original_log = storage.objects[key], storage.objects["wiki/tenant_1/log.md"]
+    retry = ingest(client)
+    assert retry.status_code == 201 and retry.json()["ingest_status"] == "unchanged"
+    assert retry.json()["updated_keys"] == []
+    assert storage.objects[key] == original_source and storage.objects["wiki/tenant_1/log.md"] == original_log
+
+    changed = ANALYSIS.replace("activo.", "cambiÃ³ sin una nueva identidad de fuente.")
+    data = payload(); files = {"file": ("meeting.md", changed, "text/markdown")}
+    assert client.post("/api/v1/ingest", data=data, files=files).status_code == 409
+    assert storage.objects[key] == original_source
+
+
+def test_retry_reconciles_missing_raw_and_triggers_source_update() -> None:
+    client, storage = api(); first = ingest(client); assert first.status_code == 201
+    source_key = first.json()["source_key"]
+    original_context = storage.objects["wiki/tenant_1/client-1/project_1/context.md"]
+    raw = "Speaker A: reuniÃ³n completa.\n".encode()
+    orphan_key = "raw/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno/transcript.txt"
+    storage.put_bytes_if_absent(orphan_key, raw, content_type="text/plain", sha256_hex=sha256(raw).hexdigest())
+
+    reconciled = ingest(client, raw=raw)
+    assert reconciled.status_code == 201 and reconciled.json()["ingest_status"] == "reconciled"
+    assert reconciled.json()["provenance_status"] == "complete"
+    assert reconciled.json()["raw_key"] in storage.binary_objects
+    assert "provenance_status: complete" in storage.objects[source_key][0]
+    assert "provenance:" in storage.objects["wiki/tenant_1/log.md"][0]
+    assert storage.objects["wiki/tenant_1/client-1/project_1/context.md"] == original_context
+
+    source_after_reconciliation = storage.objects[source_key]
+    identical = ingest(client, raw=raw)
+    assert identical.status_code == 201 and identical.json()["ingest_status"] == "unchanged"
+    assert storage.objects[source_key] == source_after_reconciliation
+
+
+def test_retry_upgrades_historical_source_without_phase_two_metadata() -> None:
+    client, storage = api(); first = ingest(client); assert first.status_code == 201
+    source_key = first.json()["source_key"]
+    current, etag = storage.objects[source_key]
+    historical = current
+    for field in (
+        "source_kind: meeting_analysis\n", "analysis_schema_version: '1'\n",
+        "raw_sources: []\n", "raw_sha256: []\n", "provenance_status: analysis_only\n",
+    ):
+        historical = historical.replace(field, "")
+    storage.objects[source_key] = (historical, etag)
+
+    response = ingest(client, raw=b"historical transcript")
+    assert response.status_code == 201 and response.json()["ingest_status"] == "reconciled"
+    upgraded = storage.objects[source_key][0]
+    assert "source_kind: meeting_analysis" in upgraded and "provenance_status: complete" in upgraded
 
 
 def test_ingest_preserves_raw_bytes_and_provenance() -> None:

@@ -37,7 +37,7 @@ Antes del primer despliegue, aplica las migraciones de `migrations/` en Cloudfla
 - `GET /api/v1/jobs/{tenant_id}/{job_id}`: estado de un trabajo del Bibliotecario.
 - `GET /api/v1/jobs/{tenant_id}?client_id=&project_id=&limit=`: trabajos recientes del alcance seleccionado.
 
-Una ingesta se guarda en `sources/{tenant}/{client}/{project}/{fecha-utc}-{titulo-slug}.md`. Una colisión de ruta devuelve `409` y nunca reemplaza la fuente. El YAML del archivo se conserva, salvo los seis metadatos canónicos que son reemplazados con los campos del formulario.
+Una ingesta se guarda en `sources/{tenant}/{client}/{project}/{fecha-utc}-{titulo-slug}.md`. Repetir el mismo análisis es idempotente: si falta el RAW, la API lo guarda y enriquece únicamente la procedencia del análisis; si ambos objetos ya son idénticos devuelve `ingest_status: unchanged`. Un cuerpo de análisis o RAW diferente bajo la misma identidad devuelve `409`. El contenido analítico permanece inmutable y el YAML original se conserva, salvo los metadatos canónicos y de procedencia administrados por la API.
 
 No se exponen aún `/query` ni `/lint`; ambos requieren la fase posterior de IA/mantenimiento.
 
