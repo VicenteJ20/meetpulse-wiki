@@ -9,6 +9,7 @@ interface Env {
   LIBRARIAN_THINKING_LEVEL: string;
   LIBRARIAN_PROVIDER_ORDER: string;
   LIBRARIAN_FALLBACK_MODEL: string;
+  LIBRARIAN_DEV_MODE?: string;
 }
 
 interface R2Notification {
@@ -63,6 +64,25 @@ function entitySchema() {
 }
 
 export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (env.LIBRARIAN_DEV_MODE !== "true") return new Response("Not found", { status: 404 });
+    if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+    let body: { source_key?: unknown };
+    try { body = await request.json<{ source_key?: unknown }>(); }
+    catch { return Response.json({ error: "invalid_json" }, { status: 400 }); }
+    if (typeof body.source_key !== "string" || !parseSourceKey(body.source_key)) {
+      return Response.json({ error: "invalid_source_key" }, { status: 422 });
+    }
+    const object = await env.WIKI_BUCKET.head(body.source_key);
+    if (!object) return Response.json({ error: "source_not_found" }, { status: 404 });
+    await env.LIBRARIAN_QUEUE.send({
+      action: "PutObject",
+      object: { key: body.source_key, eTag: object.etag },
+      eventTime: new Date().toISOString(),
+    } satisfies R2Notification);
+    return Response.json({ source_key: body.source_key, processing_status: "pending" }, { status: 202 });
+  },
+
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
     validateConfig(env);
     for (const message of batch.messages) {

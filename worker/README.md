@@ -39,3 +39,27 @@ El cron `0 3 * * *` está declarado en `wrangler.jsonc`. El modelo se controla c
 ## Desarrollo local
 
 Usa `.dev.vars` dentro de `worker/` para los secretos locales; el archivo no debe versionarse. R2, D1 y Queues pueden apuntar a recursos de desarrollo o bindings locales de Wrangler.
+
+Para consumir R2 y D1 remotos con una Queue local, conserva `remote: true` en ambos bindings y agrega a `.dev.vars`:
+
+```env
+LIBRARIAN_DEV_MODE=true
+AI_GATEWAY_API_KEY=
+LIBRARIAN_WEBHOOK_SECRET=
+```
+
+Con la API activa en `http://127.0.0.1:8000`, inicia el Worker:
+
+```powershell
+npm run dev
+```
+
+Luego publica un evento sintÃ©tico desde otra terminal. El endpoint solo existe cuando `LIBRARIAN_DEV_MODE=true`:
+
+```bash
+curl -X POST http://127.0.0.1:8787 \
+  -H "content-type: application/json" \
+  -d '{"source_key":"sources/vicente-s-tenant/Youtube/the-white-house/2026-07-17-president-trump-delivers-an-address-to-the-nation-jul-16-2026.md"}'
+```
+
+La Queue local invocarÃ¡ el consumidor; el anÃ¡lisis, el contexto, los jobs y las escrituras continuarÃ¡n usando R2/D1 remotos. No habilites `LIBRARIAN_DEV_MODE` en un despliegue.
