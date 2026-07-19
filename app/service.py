@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from hashlib import sha256
 
-from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, project_index, slugify, split_front_matter, tenant_index, validate_okf_document
+from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, parse_front_matter, project_index, slugify, split_front_matter, tenant_index, validate_meeting_analysis, validate_okf_document
 from app.storage import ObjectNotFound, ObjectStorage, PreconditionFailed, StorageError
 
 
@@ -11,14 +12,56 @@ class SourceAlreadyExists(Exception):
     pass
 
 
+class ContextConflict(Exception):
+    pass
+
+
 class WikiService:
     def __init__(self, storage: ObjectStorage) -> None:
         self.storage = storage
 
-    def ingest(self, *, tenant_id: str, client_id: str, project_id: str, title: str, date_time: datetime, participants: list[str], markdown: str) -> dict[str, object]:
+    def ingest(
+        self,
+        *,
+        tenant_id: str,
+        client_id: str,
+        project_id: str,
+        title: str,
+        date_time: datetime,
+        participants: list[str],
+        markdown: str,
+        raw_data: bytes | None = None,
+        raw_filename: str | None = None,
+        raw_content_type: str = "text/plain; charset=utf-8",
+    ) -> dict[str, object]:
+        validate_meeting_analysis(markdown)
         date_utc = date_time.replace(tzinfo=UTC) if date_time.tzinfo is None else date_time.astimezone(UTC)
         source_key = f"sources/{tenant_id}/{client_id}/{project_id}/{date_utc:%Y-%m-%d}-{slugify(title)}.md"
-        content = build_source_markdown(markdown, tenant_id=tenant_id, client_id=client_id, project_id=project_id, title=title, date_time=date_time, participants=participants)
+        raw_keys: list[str] = []
+        raw_hashes: list[str] = []
+        if raw_data is not None and raw_filename:
+            filename = self._safe_raw_filename(raw_filename)
+            raw_key = f"raw/{tenant_id}/{client_id}/{project_id}/{date_utc:%Y-%m-%d}-{slugify(title)}/{filename}"
+            raw_hash = sha256(raw_data).hexdigest()
+            try:
+                self.storage.put_bytes_if_absent(raw_key, raw_data, content_type=raw_content_type, sha256_hex=raw_hash)
+            except PreconditionFailed:
+                existing = self.storage.get_bytes(raw_key)
+                if sha256(existing.data).hexdigest() != raw_hash:
+                    raise SourceAlreadyExists(raw_key)
+            raw_keys.append(raw_key)
+            raw_hashes.append(raw_hash)
+        content = build_source_markdown(
+            markdown,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            project_id=project_id,
+            title=title,
+            date_time=date_time,
+            participants=participants,
+            raw_keys=raw_keys,
+            raw_hashes=raw_hashes,
+        )
         try:
             self.storage.put_if_absent(source_key, content)
         except PreconditionFailed as exc:
@@ -47,7 +90,12 @@ class WikiService:
         timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         event = f"- `{timestamp}` ingest: `/{source_key}` (client={client_id}, project={project_id}; wiki={', '.join(f'`/{key}`' for key in created_or_updated if key != source_key)})"
         self._update(log_key, lambda text: text.rstrip() + "\n" + event + "\n", created_or_updated)
-        return {"source_key": source_key, "updated_keys": created_or_updated}
+        return {
+            "source_key": source_key,
+            "raw_key": raw_keys[0] if raw_keys else None,
+            "provenance_status": "complete" if raw_keys else "analysis_only",
+            "updated_keys": created_or_updated,
+        }
 
     def tree(self, tenant_id: str, client_id: str | None, project_id: str | None) -> dict[str, object]:
         if project_id and not client_id:
@@ -62,13 +110,16 @@ class WikiService:
 
     def logs(self, tenant_id: str, limit: int) -> dict[str, object]:
         key = f"wiki/{tenant_id}/log.md"
-        entries = [line for line in self.storage.get_text(key).text.splitlines() if line.startswith("- `")]
-        return {"key": key, "entries": list(reversed(entries))[:limit]}
+        text = self.storage.get_text(key).text
+        entries = [line for line in text.splitlines() if line.startswith("- `")]
+        ordered = entries if re.search(r"^## \d{4}-\d{2}-\d{2}$", text, re.MULTILINE) else list(reversed(entries))
+        return {"key": key, "entries": ordered[:limit]}
 
     def dashboard_summary(self, tenant_id: str) -> dict[str, object]:
         wiki_keys, source_keys = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/")
         events = self._activity_entries(tenant_id)
-        return {"tenant_id": tenant_id, "client_count": len(self._client_ids(tenant_id, wiki_keys)), "project_count": len(self._project_index_keys(tenant_id, wiki_keys)), "source_count": len([key for key in source_keys if key.endswith(".md")]), "wiki_page_count": len([key for key in source_keys if key.endswith(".md")]) + len([key for key in wiki_keys if key.endswith("/context.md")]), "last_activity_at": events[0]["timestamp"] if events else None}
+        knowledge_pages = [key for key in wiki_keys if key.endswith(".md") and (key.endswith("/context.md") or "/decisions/" in key or "/risks/" in key)]
+        return {"tenant_id": tenant_id, "client_count": len(self._client_ids(tenant_id, wiki_keys)), "project_count": len(self._project_index_keys(tenant_id, wiki_keys)), "source_count": len([key for key in source_keys if key.endswith(".md")]), "wiki_page_count": len([key for key in source_keys if key.endswith(".md")]) + len(knowledge_pages), "last_activity_at": events[0]["timestamp"] if events else None}
 
     def dashboard_clients(self, tenant_id: str, limit: int, offset: int) -> dict[str, object]:
         wiki_keys, source_keys, events = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/"), self._activity_entries(tenant_id)
@@ -85,8 +136,9 @@ class WikiService:
         for key in self._project_index_keys(tenant_id, wiki_keys, client_id):
             project_id = key.split("/")[3]
             source_count = len([source for source in source_keys if source.startswith(f"sources/{tenant_id}/{client_id}/{project_id}/") and source.endswith(".md")])
-            context_count = int(f"wiki/{tenant_id}/{client_id}/{project_id}/context.md" in wiki_keys)
-            projects.append({"project_id": project_id, "source_count": source_count, "wiki_page_count": source_count + context_count, "last_activity_at": self._last_activity(events, client_id, project_id), "key": key})
+            project_prefix = f"wiki/{tenant_id}/{client_id}/{project_id}/"
+            knowledge_count = len([wiki_key for wiki_key in wiki_keys if wiki_key.startswith(project_prefix) and wiki_key.endswith(".md") and (wiki_key.endswith("/context.md") or "/decisions/" in wiki_key or "/risks/" in wiki_key)])
+            projects.append({"project_id": project_id, "source_count": source_count, "wiki_page_count": source_count + knowledge_count, "last_activity_at": self._last_activity(events, client_id, project_id), "key": key})
         projects.sort(key=lambda item: item["project_id"])
         return {"total": len(projects), "items": projects[offset:offset + limit], "limit": limit, "offset": offset}
 
@@ -101,14 +153,35 @@ class WikiService:
         for key in sorted(self.storage.list_keys(source_prefix), reverse=True):
             if key.endswith(".md"):
                 obj = self.storage.get_text(key)
+                metadata, _ = parse_front_matter(obj.text)
                 stem = key.rsplit("/", 1)[-1].removesuffix(".md")
-                items.append({"document": f"analysis:{stem}", "title": self._analysis_title(stem), "key": key, "updated_at": self._updated_at(obj)})
+                raw_sources = metadata.get("raw_sources") if isinstance(metadata.get("raw_sources"), list) else []
+                items.append({
+                    "document": f"analysis:{stem}", "title": metadata.get("title") or self._analysis_title(stem),
+                    "key": key, "updated_at": self._updated_at(obj), "type": "meeting",
+                    "source_kind": metadata.get("source_kind", "meeting_analysis"),
+                    "provenance_status": metadata.get("provenance_status", "analysis_only"),
+                    "raw_available": bool(raw_sources),
+                })
         context_key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"
         try:
             context = self.storage.get_text(context_key)
-            items.append({"document": "context", "title": "Project context", "key": context_key, "updated_at": self._updated_at(context)})
+            items.append({"document": "context", "title": "Project context", "key": context_key, "updated_at": self._updated_at(context), "type": "context"})
         except ObjectNotFound:
             pass
+        project_prefix = f"wiki/{tenant_id}/{client_id}/{project_id}"
+        for document_type, folder in (("decision", "decisions"), ("risk", "risks")):
+            for key in sorted(self.storage.list_keys(f"{project_prefix}/{folder}/"), reverse=True):
+                if not key.endswith(".md"):
+                    continue
+                obj = self.storage.get_text(key)
+                metadata, _ = parse_front_matter(obj.text)
+                stem = key.rsplit("/", 1)[-1].removesuffix(".md")
+                items.append({
+                    "document": f"{document_type}:{stem}", "title": metadata.get("title") or self._analysis_title(stem),
+                    "description": metadata.get("description"), "key": key, "updated_at": self._updated_at(obj),
+                    "type": document_type,
+                })
         if not items:
             raise ObjectNotFound(source_prefix)
         return {"items": items}
@@ -123,10 +196,21 @@ class WikiService:
             if not re.fullmatch(r"[a-zA-Z0-9_-]+", stem):
                 raise ValueError("invalid analysis document")
             key, title, is_analysis = f"sources/{tenant_id}/{client_id}/{project_id}/{stem}.md", self._analysis_title(stem), True
+        elif document.startswith("decision:") or document.startswith("risk:"):
+            document_type, stem = document.split(":", 1)
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", stem):
+                raise ValueError("invalid derived document")
+            folder = "decisions" if document_type == "decision" else "risks"
+            key, title, is_analysis = f"wiki/{tenant_id}/{client_id}/{project_id}/{folder}/{stem}.md", self._analysis_title(stem), False
         else:
-            raise ValueError("document must be a project context or meeting analysis")
+            raise ValueError("document must be a project context, meeting analysis, decision, or risk")
         obj = self.storage.get_text(key)
-        return {"document": document, "title": title, "key": key, "content_markdown": split_front_matter(obj.text)[1] if is_analysis else obj.text, "content_type": "text/markdown", "updated_at": self._updated_at(obj)}
+        metadata, _ = parse_front_matter(obj.text)
+        response = {"document": document, "title": metadata.get("title") or title, "key": key, "content_markdown": split_front_matter(obj.text)[1] if is_analysis else obj.text, "content_type": "text/markdown", "updated_at": self._updated_at(obj)}
+        if is_analysis:
+            raw_sources = metadata.get("raw_sources") if isinstance(metadata.get("raw_sources"), list) else []
+            response.update({"type": "meeting", "source_kind": metadata.get("source_kind", "meeting_analysis"), "provenance_status": metadata.get("provenance_status", "analysis_only"), "raw_available": bool(raw_sources)})
+        return response
 
     def update_context(self, tenant_id: str, client_id: str, project_id: str, content_markdown: str) -> dict[str, object]:
         key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"
@@ -140,6 +224,112 @@ class WikiService:
             except PreconditionFailed:
                 continue
         raise StorageError("context update conflicted repeatedly")
+
+    def apply_librarian(self, payload: dict[str, object]) -> dict[str, object]:
+        tenant_id = str(payload["tenant_id"]); client_id = str(payload["client_id"]); project_id = str(payload["project_id"])
+        source_key = str(payload["source_key"]); expected_etag = str(payload["expected_context_etag"])
+        expected_source_prefix = f"sources/{tenant_id}/{client_id}/{project_id}/"
+        if not source_key.startswith(expected_source_prefix) or not source_key.endswith(".md"):
+            raise ValueError("source_key is outside the requested project")
+        if str(payload.get("job_id", "")) != sha256(source_key.encode("utf-8")).hexdigest()[:32]:
+            raise ValueError("job_id does not match source_key")
+        self.storage.get_text(source_key)
+        context_key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"
+        current_context = self.storage.get_text(context_key)
+        if current_context.etag != expected_etag:
+            raise ContextConflict(context_key)
+
+        context = payload.get("context")
+        if not isinstance(context, dict):
+            raise ValueError("context draft is required")
+        context_sources = context.get("sources")
+        if not isinstance(context_sources, list) or source_key not in context_sources:
+            raise ValueError("context sources must include the processed analysis")
+        context_body = context.get("body")
+        if not isinstance(context_body, str) or not all(re.search(rf"^##? {heading}\s*$", context_body, re.MULTILINE | re.IGNORECASE) for heading in ("Estado actual", "Hitos", "Pendientes")):
+            raise ValueError("context body must contain Estado actual, Hitos, and Pendientes headings")
+        context_markdown = build_okf_document(
+            document_type="context",
+            title=self._required_text(context, "title"),
+            description=self._required_text(context, "description"),
+            sources=[str(item) for item in context_sources],
+            timestamp=self._parse_timestamp(self._required_text(context, "timestamp")),
+            body=context_body,
+        )
+        self._validate_wiki_document(context_markdown, tenant_id, client_id, project_id, required_type="context")
+
+        rendered_documents: list[tuple[str, str]] = []
+        documents = payload.get("documents", [])
+        if not isinstance(documents, list):
+            raise ValueError("documents must be a list")
+        for draft in documents:
+            if not isinstance(draft, dict):
+                raise ValueError("each document draft must be an object")
+            document_type = draft.get("type")
+            if document_type not in {"decision", "risk"}:
+                raise ValueError("librarian documents must be decisions or risks")
+            title = self._required_text(draft, "title")
+            timestamp_text = self._required_text(draft, "timestamp")
+            timestamp = self._parse_timestamp(timestamp_text)
+            folder = "decisions" if document_type == "decision" else "risks"
+            stable_id = sha256(f"{source_key}|{document_type}|{title}|{timestamp_text}".encode()).hexdigest()[:10]
+            key = f"wiki/{tenant_id}/{client_id}/{project_id}/{folder}/{timestamp:%Y-%m-%d}-{slugify(title)}-{stable_id}.md"
+            extra: dict[str, object] = {}
+            for relation in ("supersedes", "related"):
+                values = draft.get(relation, [])
+                if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                    raise ValueError(f"{relation} must be a list of Wiki keys")
+                relation_pattern = re.compile(rf"^wiki/{re.escape(tenant_id)}/{re.escape(client_id)}/{re.escape(project_id)}/(?:decisions|risks)/[a-zA-Z0-9_-]+\.md$")
+                if any(not relation_pattern.fullmatch(value) for value in values):
+                    raise ValueError(f"{relation} must remain inside the project")
+                if values:
+                    extra[relation] = values
+            markdown = build_okf_document(
+                document_type=str(document_type), title=title,
+                description=self._required_text(draft, "description"), sources=[source_key],
+                timestamp=timestamp, body=self._required_text(draft, "body"), extra=extra,
+            )
+            self._validate_wiki_document(markdown, tenant_id, client_id, project_id, required_type=str(document_type))
+            rendered_documents.append((key, markdown))
+
+        output_keys: list[str] = []
+        for key, markdown in rendered_documents:
+            self._put_if_absent_identical(key, markdown)
+            output_keys.append(key)
+        try:
+            self.storage.put_if_match(context_key, context_markdown, expected_etag)
+        except PreconditionFailed as exc:
+            raise ContextConflict(context_key) from exc
+        output_keys.insert(0, context_key)
+        project_key = f"wiki/{tenant_id}/{client_id}/{project_id}/index.md"
+        self._replace(project_key, self._render_project_index(tenant_id, client_id, project_id))
+        output_keys.append(project_key)
+        self._append_librarian_log(tenant_id, client_id, project_id, source_key, output_keys)
+        return {"job_id": payload.get("job_id"), "output_keys": output_keys}
+
+    def maintain_tenant(self, tenant_id: str) -> dict[str, object]:
+        wiki_keys = self.storage.list_keys(f"wiki/{tenant_id}/")
+        changed: list[str] = []
+        log_key = f"wiki/{tenant_id}/log.md"
+        try:
+            log = self.storage.get_text(log_key)
+            normalized = self._normalize_log(tenant_id, log.text)
+            if normalized != log.text:
+                self._replace(log_key, normalized); changed.append(log_key)
+        except ObjectNotFound:
+            pass
+        project_keys = self._project_index_keys(tenant_id, wiki_keys)
+        for key in project_keys:
+            parts = key.split("/")
+            rendered = self._render_project_index(tenant_id, parts[2], parts[3])
+            if self._replace_if_changed(key, rendered): changed.append(key)
+        clients = self._client_ids(tenant_id, wiki_keys)
+        for client_id in clients:
+            key = f"wiki/{tenant_id}/{client_id}/index.md"
+            if self._replace_if_changed(key, self._render_client_index(tenant_id, client_id)): changed.append(key)
+        tenant_key = f"wiki/{tenant_id}/index.md"
+        if self._replace_if_changed(tenant_key, self._render_tenant_index(tenant_id)): changed.append(tenant_key)
+        return {"tenant_id": tenant_id, "updated_keys": changed}
 
     @staticmethod
     def _analysis_title(stem: str) -> str:
@@ -168,6 +358,142 @@ class WikiService:
     @staticmethod
     def _last_activity(entries: list[dict[str, str]], client_id: str, project_id: str | None = None) -> str | None:
         return next((entry["timestamp"] for entry in entries if entry["client_id"] == client_id and (project_id is None or entry["project_id"] == project_id)), None)
+
+    @staticmethod
+    def _safe_raw_filename(filename: str) -> str:
+        basename = re.split(r"[\\/]", filename)[-1]
+        if not basename or "." not in basename:
+            raise ValueError("raw_file must have a filename with an extension")
+        stem, extension = basename.rsplit(".", 1)
+        if extension.lower() not in {"md", "txt"}:
+            raise ValueError("raw_file must be a UTF-8 .md or .txt file")
+        return f"{slugify(stem)}.{extension.lower()}"
+
+    @staticmethod
+    def _required_text(value: dict[str, object], field: str) -> str:
+        item = value.get(field)
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{field} must be a non-empty string")
+        return item
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        if not value.endswith("Z"):
+            raise ValueError("timestamp must be RFC 3339 UTC ending in Z")
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError as exc:
+            raise ValueError("timestamp must be RFC 3339 UTC ending in Z") from exc
+        return parsed
+
+    def _put_if_absent_identical(self, key: str, text: str) -> None:
+        try:
+            self.storage.put_if_absent(key, text)
+        except PreconditionFailed:
+            if self.storage.get_text(key).text != text:
+                raise ValueError(f"existing derived document differs: {key}")
+
+    def _replace(self, key: str, text: str) -> None:
+        for _ in range(5):
+            current = self.storage.get_text(key)
+            if current.text == text:
+                return
+            try:
+                self.storage.put_if_match(key, text, current.etag)
+                return
+            except PreconditionFailed:
+                continue
+        raise StorageError(f"too much concurrent activity updating {key}")
+
+    def _replace_if_changed(self, key: str, text: str) -> bool:
+        try:
+            current = self.storage.get_text(key)
+        except ObjectNotFound:
+            try:
+                self.storage.put_if_absent(key, text)
+                return True
+            except PreconditionFailed:
+                current = self.storage.get_text(key)
+        if current.text == text:
+            return False
+        self._replace(key, text)
+        return True
+
+    def _render_project_index(self, tenant_id: str, client_id: str, project_id: str) -> str:
+        project_prefix = f"wiki/{tenant_id}/{client_id}/{project_id}"
+        lines = [f"# Wiki: project {project_id}", "", "## Context", ""]
+        context_key = f"{project_prefix}/context.md"
+        try:
+            context = self.storage.get_text(context_key)
+            metadata, _ = parse_front_matter(context.text)
+            lines.append(f"- [Context](context.md) — {metadata.get('description', 'Current project context')}")
+        except ObjectNotFound:
+            pass
+        lines.extend(["", "## Reuniones analizadas", ""])
+        source_prefix = f"sources/{tenant_id}/{client_id}/{project_id}/"
+        for key in sorted(self.storage.list_keys(source_prefix), reverse=True):
+            if not key.endswith(".md"): continue
+            metadata, _ = parse_front_matter(self.storage.get_text(key).text)
+            title = metadata.get("title") or self._analysis_title(key.rsplit("/", 1)[-1].removesuffix(".md"))
+            date = metadata.get("date_time", "")
+            description = f"Reunión analizada {str(date)[:10]}".rstrip()
+            lines.append(f"- [{title}](/{key}) — {description}")
+        for heading, folder in (("Decisiones", "decisions"), ("Riesgos", "risks")):
+            lines.extend(["", f"## {heading}", ""])
+            for key in sorted(self.storage.list_keys(f"{project_prefix}/{folder}/"), reverse=True):
+                if not key.endswith(".md"): continue
+                metadata, _ = parse_front_matter(self.storage.get_text(key).text)
+                relative = key.removeprefix(project_prefix + "/")
+                lines.append(f"- [{metadata.get('title', self._analysis_title(relative))}]({relative}) — {metadata.get('description', '')}".rstrip())
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _render_client_index(self, tenant_id: str, client_id: str) -> str:
+        keys = self.storage.list_keys(f"wiki/{tenant_id}/{client_id}/")
+        lines = [f"# Wiki: client {client_id}", "", "## Projects", ""]
+        for key in sorted(self._project_index_keys(tenant_id, keys, client_id)):
+            project_id = key.split("/")[3]
+            description = "Project knowledge"
+            try:
+                context = self.storage.get_text(f"wiki/{tenant_id}/{client_id}/{project_id}/context.md")
+                description = str(parse_front_matter(context.text)[0].get("description") or description)
+            except ObjectNotFound:
+                pass
+            lines.append(f"- [{project_id}]({project_id}/index.md) — {description}")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _render_tenant_index(self, tenant_id: str) -> str:
+        keys = self.storage.list_keys(f"wiki/{tenant_id}/")
+        lines = [f"# Wiki: tenant {tenant_id}", "", "## Clients", ""]
+        for client_id in self._client_ids(tenant_id, keys):
+            projects = self._project_index_keys(tenant_id, keys, client_id)
+            lines.append(f"- [{client_id}]({client_id}/index.md) — {len(projects)} project(s)")
+        return "\n".join(lines).rstrip() + "\n"
+
+    @staticmethod
+    def _normalize_log(tenant_id: str, text: str) -> str:
+        entries = {line for line in text.splitlines() if line.startswith("- `")}
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for line in entries:
+            match = re.match(r"^- `([^`]+)`", line)
+            if not match: continue
+            timestamp = match.group(1)
+            try:
+                parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            grouped.setdefault(parsed.date().isoformat(), []).append((timestamp, line))
+        lines = [f"# Activity log: tenant {tenant_id}", ""]
+        for date in sorted(grouped, reverse=True):
+            lines.extend([f"## {date}", ""])
+            lines.extend(line for _, line in sorted(grouped[date], key=lambda item: item[0], reverse=True))
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _append_librarian_log(self, tenant_id: str, client_id: str, project_id: str, source_key: str, output_keys: list[str]) -> None:
+        timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        event = f"- `{timestamp}` librarian: `/{source_key}` (client={client_id}, project={project_id}; outputs={', '.join(f'`/{key}`' for key in output_keys)})"
+        log_key = f"wiki/{tenant_id}/log.md"
+        self._update(log_key, lambda text: text if event in text else text.rstrip() + "\n" + event + "\n", [])
 
     def _validate_wiki_document(self, markdown: str, tenant_id: str, client_id: str, project_id: str, *, required_type: str | None = None) -> None:
         metadata = validate_okf_document(

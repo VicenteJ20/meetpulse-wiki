@@ -63,7 +63,7 @@ def test_real_r2_ingest_tree_logs_and_collision(api_client, r2_storage: R2Storag
         "date_time": "2026-07-12T15:30:00-04:00",
         "participants": ["MeetPulse QA", "R2"],
     }
-    files = {"file": ("transcript.md", "---\nsource: integration-test\n---\n\n# Prueba real\n", "text/markdown")}
+    files = {"file": ("analysis.md", "---\nsource: integration-test\n---\n\n## Contexto y Estado Actual\n\nPrueba real.\n\n## Decisiones Tomadas\n\nNo se tomaron decisiones.\n", "text/markdown")}
 
     created = api_client.post("/api/v1/ingest", data=data, files=files)
     assert created.status_code == 201, created.text
@@ -106,7 +106,7 @@ def test_real_r2_ingest_tree_logs_and_collision(api_client, r2_storage: R2Storag
     assert len(documents.json()["items"]) == 2
     document = api_client.get(f"/api/v1/wiki/{tenant_id}/documents/analysis:2026-07-12-validacion-real-r2", params={"client_id": "integration-client", "project_id": "r2-check"})
     assert document.status_code == 200, document.text
-    assert document.json()["content_markdown"].startswith("# Prueba real")
+    assert document.json()["content_markdown"].startswith("## Contexto y Estado Actual")
 
     collision = api_client.post("/api/v1/ingest", data=data, files=files)
     assert collision.status_code == 409, collision.text

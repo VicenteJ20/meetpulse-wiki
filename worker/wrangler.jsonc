@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "meetpulse-librarian",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-18",
+  "vars": {
+    "LIBRARIAN_MODEL": "google/gemini-3.1-flash-lite",
+    "LIBRARIAN_THINKING_LEVEL": "minimal",
+    "LIBRARIAN_PROVIDER_ORDER": "google,vertex",
+    "LIBRARIAN_FALLBACK_MODEL": "",
+    "LIBRARIAN_API_BASE_URL": "http://127.0.0.1:8000" // For local development, must be changed once deployed
+  },
+  "r2_buckets": [
+    { "binding": "WIKI_BUCKET", "bucket_name": "meetpulse-wiki", "remote": true }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "meetpulse-wiki", "database_id": "ea669796-77a2-477a-b8d7-c18adb70b566", "remote": true }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "LIBRARIAN_QUEUE", "queue": "meetpulse-librarian" }
+    ],
+    "consumers": [
+      {
+        "queue": "meetpulse-librarian",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "retry_delay": 30,
+        "dead_letter_queue": "meetpulse-librarian-dlq"
+      }
+    ]
+  },
+  "triggers": { "crons": ["0 3 * * *"] }
+}
