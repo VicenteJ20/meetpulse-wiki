@@ -3,3 +3,8 @@
 __pycache__/
 .pytest_cache/
 .test-deps/
+node_modules/
+.wrangler/
+.dev.vars
+.vercel/
+.env.local

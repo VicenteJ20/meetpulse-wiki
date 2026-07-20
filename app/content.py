@@ -10,6 +10,29 @@ import yaml
 ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 LINK_RE = re.compile(r"^- \[([^]]+)]\(([^)]+)\)$", re.MULTILINE)
 CANONICAL_FIELDS = {"tenant_id", "client_id", "project_id", "title", "date_time", "participants"}
+OKF_REQUIRED_FIELDS = {"type", "title", "description", "sources", "timestamp"}
+OKF_TYPES = {"context", "meeting", "decision", "risk"}
+WIKI_SCOPE_FIELDS = {"tenant_id", "client_id", "project_id"}
+INFORMATION_HEADINGS = {
+    "objetivo", "objetivo de la sesion", "contexto", "contexto y estado actual",
+    "estado actual", "temas", "temas discutidos", "objective", "context",
+    "current state", "topics", "topics discussed",
+}
+OUTCOME_HEADINGS = {
+    "decisiones", "decisiones tomadas", "compromisos", "compromisos y proximos pasos",
+    "proximos pasos", "riesgos", "puntos sin resolver", "decisions", "decisions made",
+    "commitments", "next steps", "risks", "unresolved points", "open questions",
+}
+
+
+class _NoTimestampSafeLoader(yaml.SafeLoader):
+    """Keep YAML timestamps as strings so the OKF timestamp syntax is enforceable."""
+
+
+_NoTimestampSafeLoader.yaml_implicit_resolvers = {
+    first: [resolver for resolver in resolvers if resolver[0] != "tag:yaml.org,2002:timestamp"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 
 
 def validate_identifier(value: str, field_name: str) -> str:
@@ -27,27 +50,150 @@ def slugify(title: str) -> str:
     return slug
 
 
-def split_front_matter(markdown: str) -> tuple[dict[str, Any], str]:
+def _parse_front_matter(markdown: str, *, required: bool = False) -> tuple[dict[str, Any], str]:
     if not markdown.startswith("---") or not re.match(r"^---\s*\r?\n", markdown):
+        if required:
+            raise ValueError("front matter YAML is required")
         return {}, markdown
     match = re.compile(r"^---\s*$|^\.\.\.\s*$", re.MULTILINE).search(markdown, 4)
     if match is None:
         raise ValueError("front matter YAML is not closed")
     raw_yaml = markdown[4:match.start()]
     try:
-        parsed = yaml.safe_load(raw_yaml) or {}
+        parsed = yaml.load(raw_yaml, Loader=_NoTimestampSafeLoader) or {}
     except yaml.YAMLError as exc:
         raise ValueError("front matter YAML is invalid") from exc
     if not isinstance(parsed, dict):
         raise ValueError("front matter YAML must be a mapping")
     body = markdown[match.end():].lstrip("\r\n")
-    return {key: value for key, value in parsed.items() if key not in CANONICAL_FIELDS}, body
+    return parsed, body
 
 
-def build_source_markdown(markdown: str, *, tenant_id: str, client_id: str, project_id: str, title: str, date_time: datetime, participants: list[str]) -> str:
+def split_front_matter(markdown: str) -> tuple[dict[str, Any], str]:
+    metadata, body = _parse_front_matter(markdown)
+    return {key: value for key, value in metadata.items() if key not in CANONICAL_FIELDS}, body
+
+
+def parse_front_matter(markdown: str) -> tuple[dict[str, Any], str]:
+    return _parse_front_matter(markdown)
+
+
+def _normalized_heading(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+
+
+def validate_meeting_analysis(markdown: str) -> None:
+    """Require semantic structure while allowing producer-specific heading names."""
+    _, body = _parse_front_matter(markdown)
+    if not body.strip():
+        raise ValueError("meeting analysis must not be empty")
+    headings = {
+        _normalized_heading(match.group(1))
+        for match in re.finditer(r"^#{2,3}\s+(.+?)\s*$", body, re.MULTILINE)
+    }
+    if not headings:
+        raise ValueError("meeting analysis must contain Markdown section headings")
+    has_information = any(
+        heading in INFORMATION_HEADINGS or any(alias in heading for alias in INFORMATION_HEADINGS)
+        for heading in headings
+    )
+    has_outcome = any(
+        heading in OUTCOME_HEADINGS or any(alias in heading for alias in OUTCOME_HEADINGS)
+        for heading in headings
+    )
+    if not has_information:
+        raise ValueError("meeting analysis must contain an objective, context, state, or topics section")
+    if not has_outcome:
+        raise ValueError("meeting analysis must contain a decisions, commitments, risks, or unresolved section")
+
+
+def validate_okf_document(markdown: str, *, tenant_id: str, client_id: str, project_id: str, required_type: str | None = None) -> dict[str, Any]:
+    """Validate the front matter contract for a derived document in ``wiki/``."""
+    metadata, _ = _parse_front_matter(markdown, required=True)
+    missing = sorted(field for field in OKF_REQUIRED_FIELDS if field not in metadata)
+    if missing:
+        raise ValueError(f"OKF front matter is missing required fields: {', '.join(missing)}")
+    duplicated_scope = sorted(field for field in WIKI_SCOPE_FIELDS if field in metadata)
+    if duplicated_scope:
+        raise ValueError(f"OKF front matter must not duplicate path scope fields: {', '.join(duplicated_scope)}")
+
+    document_type = metadata["type"]
+    if not isinstance(document_type, str) or document_type not in OKF_TYPES:
+        raise ValueError("OKF type must be one of: context, meeting, decision, risk")
+    if required_type and document_type != required_type:
+        raise ValueError(f"OKF type must be {required_type}")
+    for field in ("title", "description"):
+        if not isinstance(metadata[field], str) or not metadata[field].strip():
+            raise ValueError(f"OKF {field} must be a non-empty string")
+
+    timestamp = metadata["timestamp"]
+    if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
+        raise ValueError("OKF timestamp must be an RFC 3339 UTC timestamp ending in Z")
+    try:
+        parsed_timestamp = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError("OKF timestamp must be an RFC 3339 UTC timestamp ending in Z") from exc
+    if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() != UTC.utcoffset(parsed_timestamp):
+        raise ValueError("OKF timestamp must be an RFC 3339 UTC timestamp ending in Z")
+
+    sources = metadata["sources"]
+    if not isinstance(sources, list) or not sources or any(not isinstance(source, str) or not source for source in sources):
+        raise ValueError("OKF sources must be a non-empty list of source keys")
+    if len(sources) != len(set(sources)):
+        raise ValueError("OKF sources must not contain duplicate source keys")
+    expected_prefix = f"sources/{tenant_id}/{client_id}/{project_id}/"
+    if any(not source.startswith(expected_prefix) or not source.endswith(".md") for source in sources):
+        raise ValueError("OKF sources must belong to the same tenant, client, and project")
+    return metadata
+
+
+def build_okf_document(*, document_type: str, title: str, description: str, sources: list[str], timestamp: datetime, body: str = "", extra: dict[str, Any] | None = None) -> str:
+    """Render a validated OKF document generated by the service."""
+    utc_timestamp = timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp.astimezone(UTC)
+    metadata = {
+        "type": document_type,
+        "title": title,
+        "description": description,
+        "sources": sources,
+        "timestamp": utc_timestamp.isoformat().replace("+00:00", "Z"),
+    }
+    if extra:
+        collisions = set(extra) & (OKF_REQUIRED_FIELDS | WIKI_SCOPE_FIELDS)
+        if collisions:
+            raise ValueError(f"OKF extra metadata collides with reserved fields: {', '.join(sorted(collisions))}")
+        metadata.update(extra)
+    return "---\n" + yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip() + "\n---\n\n" + body
+
+
+def build_source_markdown(
+    markdown: str,
+    *,
+    tenant_id: str,
+    client_id: str,
+    project_id: str,
+    title: str,
+    date_time: datetime,
+    participants: list[str],
+    raw_keys: list[str],
+    raw_hashes: list[str],
+) -> str:
     extras, body = split_front_matter(markdown)
     utc_datetime = date_time.replace(tzinfo=UTC) if date_time.tzinfo is None else date_time.astimezone(UTC)
-    metadata: dict[str, Any] = {**extras, "tenant_id": tenant_id, "client_id": client_id, "project_id": project_id, "title": title, "date_time": utc_datetime.isoformat().replace("+00:00", "Z"), "participants": participants}
+    metadata: dict[str, Any] = {
+        **extras,
+        "source_kind": "meeting_analysis",
+        "analysis_schema_version": "1",
+        "raw_sources": raw_keys,
+        "raw_sha256": raw_hashes,
+        "provenance_status": "complete" if raw_keys else "analysis_only",
+        "tenant_id": tenant_id,
+        "client_id": client_id,
+        "project_id": project_id,
+        "title": title,
+        "date_time": utc_datetime.isoformat().replace("+00:00", "Z"),
+        "participants": participants,
+    }
     return "---\n" + yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip() + "\n---\n\n" + body
 
 

@@ -31,5 +31,11 @@ class Settings(BaseSettings):
     cloudflare_account_id: str
     cloudflare_d1_database_id: str
     cloudflare_d1_api_token: str
+    librarian_webhook_secret: str = ""
+    require_raw_source: bool = False
+    librarian_model: str = "google/gemini-3.1-flash-lite"
+    librarian_thinking_level: str = "minimal"
+    librarian_provider_order: str = "google,vertex"
+    librarian_fallback_model: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

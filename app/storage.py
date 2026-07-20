@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from datetime import datetime
 from typing import Protocol
 
@@ -29,12 +30,25 @@ class StoredObject:
     last_modified: datetime | None = None
 
 
+@dataclass(frozen=True)
+class StoredBytes:
+    data: bytes
+    etag: str
+    content_type: str | None = None
+    sha256: str | None = None
+    last_modified: datetime | None = None
+
+
 class ObjectStorage(Protocol):
     def get_text(self, key: str) -> StoredObject: ...
+
+    def get_bytes(self, key: str) -> StoredBytes: ...
 
     def put_if_absent(self, key: str, text: str) -> None: ...
 
     def put_if_match(self, key: str, text: str, etag: str) -> None: ...
+
+    def put_bytes_if_absent(self, key: str, data: bytes, *, content_type: str, sha256_hex: str) -> None: ...
 
     def list_keys(self, prefix: str) -> list[str]: ...
 
@@ -71,11 +85,47 @@ class R2Storage:
         except (EndpointConnectionError, UnicodeDecodeError) as exc:
             raise StorageError(str(exc)) from exc
 
+    def get_bytes(self, key: str) -> StoredBytes:
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+            data = response["Body"].read()
+            metadata = response.get("Metadata", {})
+            return StoredBytes(
+                data=data,
+                etag=response["ETag"].strip('"'),
+                content_type=response.get("ContentType"),
+                sha256=metadata.get("sha256") or sha256(data).hexdigest(),
+                last_modified=response.get("LastModified"),
+            )
+        except ClientError as exc:
+            if exc.response["Error"].get("Code") in {"NoSuchKey", "404", "NotFound"}:
+                raise ObjectNotFound(key) from exc
+            raise StorageError(str(exc)) from exc
+        except EndpointConnectionError as exc:
+            raise StorageError(str(exc)) from exc
+
     def put_if_absent(self, key: str, text: str) -> None:
         self._put(key, text, IfNoneMatch="*")
 
     def put_if_match(self, key: str, text: str, etag: str) -> None:
         self._put(key, text, IfMatch=etag)
+
+    def put_bytes_if_absent(self, key: str, data: bytes, *, content_type: str, sha256_hex: str) -> None:
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+                Metadata={"sha256": sha256_hex},
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            if exc.response["Error"].get("Code") in {"PreconditionFailed", "412"}:
+                raise PreconditionFailed(key) from exc
+            raise StorageError(str(exc)) from exc
+        except EndpointConnectionError as exc:
+            raise StorageError(str(exc)) from exc
 
     def _put(self, key: str, text: str, **conditions: str) -> None:
         try:

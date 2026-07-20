@@ -1,20 +1,35 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import logging
 import re
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.content import validate_identifier
-from app.service import SourceAlreadyExists, WikiService
+from app.service import ContextConflict, SourceAlreadyExists, WikiService
 from app.storage import ObjectNotFound, ObjectStorage, R2Storage, StorageError
 from app.auth import GoogleTokenVerifier
 from app.config import CorsSettings, Settings
 from app.identity import D1Store, IdentityStore, User
+from app.jobs import D1JobStore, JobStore, job_id_for_source
+from app.librarian import InvalidLibrarianSignature, verify_librarian_signature
 
 
-def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | None = None, verifier: GoogleTokenVerifier | None = None) -> FastAPI:
+logger = logging.getLogger(__name__)
+
+
+def create_app(
+    storage: ObjectStorage | None = None,
+    identity: IdentityStore | None = None,
+    verifier: GoogleTokenVerifier | None = None,
+    jobs: JobStore | None = None,
+    *,
+    require_raw_source: bool | None = None,
+    librarian_secret: str | None = None,
+) -> FastAPI:
     app = FastAPI(title="MeetPulse Wiki API", version="1.0.0")
     app.add_middleware(
         CORSMiddleware,
@@ -25,10 +40,13 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
     app.state.storage = storage
     app.state.identity = identity
     app.state.verifier = verifier
+    app.state.jobs = jobs
+    app.state.require_raw_source = require_raw_source
+    app.state.librarian_secret = librarian_secret
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
-        if request.method == "OPTIONS" or request.url.path in {"/docs", "/openapi.json", "/redoc"}:
+        if request.method == "OPTIONS" or request.url.path in {"/docs", "/openapi.json", "/redoc"} or request.url.path.startswith("/api/v1/internal/librarian/"):
             return await call_next(request)
         from fastapi.responses import JSONResponse
         header = request.headers.get("authorization", "")
@@ -39,7 +57,7 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
                 request.app.state.verifier = GoogleTokenVerifier(Settings().google_oauth_client_id)
             current_verifier = request.app.state.verifier
             request.state.user = current_verifier.verify(header[7:])
-            tenant_match = re.match(r"/api/v1/(?:tree|logs|dashboard|wiki)/([^/]+)", request.url.path)
+            tenant_match = re.match(r"/api/v1/(?:tree|logs|dashboard|wiki|jobs)/([^/]+)", request.url.path)
             if tenant_match:
                 active_store = request.app.state.identity
                 if active_store is None:
@@ -61,6 +79,23 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
             request.app.state.identity = D1Store(settings.cloudflare_account_id, settings.cloudflare_d1_database_id, settings.cloudflare_d1_api_token)
         return request.app.state.identity
 
+    def job_store(request: Request) -> JobStore:
+        if request.app.state.jobs is not None:
+            return request.app.state.jobs
+        active_identity = identities(request)
+        if not isinstance(active_identity, D1Store):
+            raise HTTPException(status_code=503, detail="Librarian job store is not configured")
+        request.app.state.jobs = D1JobStore(active_identity)
+        return request.app.state.jobs
+
+    def raw_is_required(request: Request) -> bool:
+        configured = request.app.state.require_raw_source
+        return Settings().require_raw_source if configured is None else configured
+
+    def webhook_secret(request: Request) -> str:
+        configured = request.app.state.librarian_secret
+        return Settings().librarian_webhook_secret if configured is None else configured
+
     def current_user(request: Request) -> User: return request.state.user
     def require_owner(request: Request, tenant_id: str) -> None:
         if identities(request).role_for(current_user(request), tenant_id) != "owner":
@@ -76,6 +111,7 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
     async def ingest(
         request: Request,
         file: UploadFile = File(...),
+        raw_file: UploadFile | None = File(None),
         tenant_id: str = Form(...), client_id: str = Form(...), project_id: str = Form(...),
         title: str = Form(...), date_time: datetime = Form(...), participants: list[str] = Form(...),
     ) -> dict[str, object]:
@@ -92,13 +128,106 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
             raise HTTPException(status_code=422, detail="file must be UTF-8") from exc
         if not markdown.strip():
             raise HTTPException(status_code=422, detail="file must not be empty")
+        if raw_is_required(request) and raw_file is None:
+            raise HTTPException(status_code=422, detail="raw_file is required")
+        raw_data: bytes | None = None
+        if raw_file is not None:
+            if not raw_file.filename:
+                raise HTTPException(status_code=422, detail="raw_file must have a filename")
+            raw_data = await raw_file.read()
+            if not raw_data:
+                raise HTTPException(status_code=422, detail="raw_file must not be empty")
+            try:
+                raw_data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(status_code=422, detail="raw_file must be UTF-8") from exc
         try:
-            return service(request).ingest(tenant_id=tenant_id, client_id=client_id, project_id=project_id,
-                                           title=title, date_time=date_time, participants=participants, markdown=markdown)
+            result = service(request).ingest(
+                tenant_id=tenant_id, client_id=client_id, project_id=project_id,
+                title=title, date_time=date_time, participants=participants, markdown=markdown,
+                raw_data=raw_data, raw_filename=raw_file.filename if raw_file else None,
+                raw_content_type=raw_file.content_type or "text/plain; charset=utf-8" if raw_file else "text/plain; charset=utf-8",
+            )
+            job_id = job_id_for_source(str(result["source_key"]))
+            try:
+                job_store(request).create_pending(
+                    job_id=job_id, source_key=str(result["source_key"]), tenant_id=tenant_id,
+                    client_id=client_id, project_id=project_id,
+                )
+            except Exception as exc:
+                # R2 notifications reconstruct missing jobs, so a transient D1
+                # failure must not turn a successful immutable ingest into a 500.
+                logger.warning("Could not create pending librarian job (%s)", type(exc).__name__)
+            return {**result, "job_id": job_id, "processing_status": "pending"}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except SourceAlreadyExists as exc:
             raise HTTPException(status_code=409, detail={"source_key": str(exc)}) from exc
+        except StorageError as exc:
+            raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
+
+    @app.get("/api/v1/jobs/{tenant_id}")
+    def list_jobs(
+        request: Request, tenant_id: str, client_id: str | None = None, project_id: str | None = None,
+        limit: int = Query(50, ge=1, le=100),
+    ) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        if client_id: client_id = identifier(client_id, "client_id")
+        if project_id:
+            if not client_id: raise HTTPException(status_code=422, detail="client_id is required when project_id is provided")
+            project_id = identifier(project_id, "project_id")
+        return {"items": job_store(request).list(tenant_id, client_id=client_id, project_id=project_id, limit=limit)}
+
+    @app.get("/api/v1/jobs/{tenant_id}/{job_id}")
+    def get_job(request: Request, tenant_id: str, job_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            raise HTTPException(status_code=422, detail="invalid job_id")
+        job = job_store(request).get(tenant_id, job_id)
+        if job is None: raise HTTPException(status_code=404, detail="Librarian job not found")
+        return job
+
+    async def signed_payload(request: Request) -> dict[str, object]:
+        body = await request.body()
+        try:
+            verify_librarian_signature(
+                body=body, timestamp=request.headers.get("x-librarian-timestamp"),
+                signature=request.headers.get("x-librarian-signature"), secret=webhook_secret(request),
+            )
+        except InvalidLibrarianSignature as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail="Request body must be JSON") from exc
+        if not isinstance(payload, dict): raise HTTPException(status_code=422, detail="Request body must be an object")
+        return payload
+
+    @app.post("/api/v1/internal/librarian/apply")
+    async def apply_librarian(request: Request) -> dict[str, object]:
+        payload = await signed_payload(request)
+        try:
+            for field in ("tenant_id", "client_id", "project_id"):
+                if field not in payload: raise ValueError(f"{field} is required")
+                payload[field] = validate_identifier(str(payload[field]), field)
+            return service(request).apply_librarian(payload)
+        except ContextConflict as exc:
+            raise HTTPException(status_code=409, detail={"context_key": str(exc)}) from exc
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ObjectNotFound as exc:
+            raise HTTPException(status_code=404, detail={"key": str(exc)}) from exc
+        except StorageError as exc:
+            raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
+
+    @app.post("/api/v1/internal/librarian/maintenance")
+    async def maintain_librarian(request: Request) -> dict[str, object]:
+        payload = await signed_payload(request)
+        try:
+            tenant_id = validate_identifier(str(payload["tenant_id"]), "tenant_id")
+            return service(request).maintain_tenant(tenant_id)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except StorageError as exc:
             raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
 
@@ -203,6 +332,8 @@ def create_app(storage: ObjectStorage | None = None, identity: IdentityStore | N
         client_id, project_id = identifier(client_id, "client_id"), identifier(project_id, "project_id")
         try:
             return service(request).update_context(tenant_id, client_id, project_id, content_markdown)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ObjectNotFound as exc:
             raise HTTPException(status_code=404, detail={"key": str(exc)}) from exc
         except StorageError as exc:
