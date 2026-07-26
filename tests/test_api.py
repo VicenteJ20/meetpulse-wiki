@@ -226,6 +226,21 @@ def test_dashboard_and_document_reading() -> None:
     assert context["metadata"]["type"] == "context"
 
 
+def test_document_listing_supports_filters_and_pagination() -> None:
+    client, _ = api(); assert ingest(client).status_code == 201
+    assert ingest(client, title="Second meeting").status_code == 201
+    endpoint = "/api/v1/wiki/tenant_1/documents"
+    scope = {"client_id": "client-1", "project_id": "project_1"}
+
+    meetings = client.get(endpoint, params={**scope, "document_type": "meeting", "limit": 1, "offset": 1})
+    assert meetings.status_code == 200
+    assert meetings.json()["total"] == 2 and len(meetings.json()["items"]) == 1
+    assert meetings.json()["items"][0]["type"] == "meeting"
+
+    invalid = client.get(endpoint, params={**scope, "document_type": "raw"})
+    assert invalid.status_code == 422
+
+
 def test_context_okf_validation_and_update() -> None:
     client, _ = api(); assert ingest(client).status_code == 201
     endpoint = "/api/v1/wiki/tenant_1/documents/context"; params = {"client_id": "client-1", "project_id": "project_1"}

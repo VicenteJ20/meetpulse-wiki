@@ -54,7 +54,8 @@ def create_app(
             return JSONResponse(status_code=401, content={"detail": "Bearer token required"})
         try:
             if request.app.state.verifier is None:
-                request.app.state.verifier = GoogleTokenVerifier(Settings().google_oauth_client_id)
+                settings = Settings()
+                request.app.state.verifier = GoogleTokenVerifier(settings.google_oauth_audiences())
             current_verifier = request.app.state.verifier
             request.state.user = current_verifier.verify(header[7:])
             tenant_match = re.match(r"/api/v1/(?:tree|logs|dashboard|wiki|jobs)/([^/]+)", request.url.path)
@@ -290,14 +291,20 @@ def create_app(
             raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
 
     @app.get("/api/v1/wiki/{tenant_id}/documents")
-    def list_documents(request: Request, tenant_id: str, client_id: str | None = None, project_id: str | None = None) -> dict[str, object]:
+    def list_documents(
+        request: Request, tenant_id: str, client_id: str | None = None, project_id: str | None = None,
+        document_type: list[str] | None = Query(None), limit: int | None = Query(None, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, object]:
         tenant_id = identifier(tenant_id, "tenant_id")
         if client_id:
             client_id = identifier(client_id, "client_id")
         if project_id:
             project_id = identifier(project_id, "project_id")
         try:
-            return service(request).list_documents(tenant_id, client_id, project_id)
+            invalid_types = sorted(set(document_type or ()) - {"context", "meeting", "decision", "risk"})
+            if invalid_types: raise ValueError(f"invalid document types: {', '.join(invalid_types)}")
+            return service(request).list_documents(tenant_id, client_id, project_id, document_types=set(document_type or ()), limit=limit, offset=offset)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except ObjectNotFound as exc:
