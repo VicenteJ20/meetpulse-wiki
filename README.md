@@ -19,6 +19,10 @@ Vercel detecta `api/index.py` como el punto de entrada de FastAPI. Importa el re
 
 Antes del primer despliegue, aplica las migraciones de `migrations/` en Cloudflare D1. Las credenciales de R2 y el token de D1 se mantienen exclusivamente como variables secretas de Vercel.
 
+La API acepta ID tokens emitidos para más de un cliente Google OAuth. Conserva el cliente principal en `GOOGLE_OAUTH_CLIENT_ID` y agrega clientes adicionales, como Clara, en `GOOGLE_OAUTH_CLIENT_IDS` separados por comas. Todos se validan contra la misma identidad estable `sub` y las mismas membresías de tenant.
+
+Clara consume exclusivamente los endpoints de lectura de esta API con el ID token del usuario; no recibe credenciales R2 ni acceso directo al bucket.
+
 ## Endpoints
 
 - `POST /api/v1/ingest`: `multipart/form-data` con el análisis `file` (`.md` UTF-8), la transcripción opcional `raw_file` (`.md`/`.txt` UTF-8), alcance, título, fecha y participantes. Devuelve `job_id` y estado de procesamiento.
@@ -31,7 +35,7 @@ Antes del primer despliegue, aplica las migraciones de `migrations/` en Cloudfla
 - `GET /api/v1/dashboard/{tenant_id}/clients?limit=50&offset=0`: clientes con sus contadores y actividad.
 - `GET /api/v1/dashboard/{tenant_id}/clients/{client_id}/projects`: proyectos del cliente y sus contadores.
 - `GET /api/v1/dashboard/{tenant_id}/activity?limit=20`: eventos de ingesta listos para una vista de actividad.
-- `GET /api/v1/wiki/{tenant_id}/documents?client_id=&project_id=`: documentos disponibles dentro del alcance seleccionado.
+- `GET /api/v1/wiki/{tenant_id}/documents?client_id=&project_id=&document_type=&limit=&offset=`: documentos disponibles, con filtros de tipo y paginación opcionales.
 - `GET /api/v1/wiki/{tenant_id}/documents/{document}?client_id=&project_id=`: contenido Markdown de una fuente de análisis o del contexto de proyecto.
 - `PUT /api/v1/wiki/{tenant_id}/documents/context?client_id=&project_id=`: actualiza el contexto con un documento OKF completo en `content_markdown`.
 - `GET /api/v1/jobs/{tenant_id}/{job_id}`: estado de un trabajo del Bibliotecario.

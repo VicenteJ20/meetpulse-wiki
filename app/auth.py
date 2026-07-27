@@ -1,6 +1,6 @@
 from __future__ import annotations
 import logging
-from typing import Any
+from typing import Any, Sequence
 import jwt
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -11,11 +11,15 @@ bearer = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 class GoogleTokenVerifier:
-    def __init__(self, audience: str) -> None: self.audience, self.jwks = audience, PyJWKClient("https://www.googleapis.com/oauth2/v3/certs")
+    def __init__(self, audiences: str | Sequence[str]) -> None:
+        self.audiences = [audiences] if isinstance(audiences, str) else list(audiences)
+        if not self.audiences:
+            raise ValueError("At least one Google OAuth client ID must be configured")
+        self.jwks = PyJWKClient("https://www.googleapis.com/oauth2/v3/certs")
     def verify(self, token: str) -> User:
         try:
             key = self.jwks.get_signing_key_from_jwt(token).key
-            claims: dict[str, Any] = jwt.decode(token, key, algorithms=["RS256"], audience=self.audience, issuer=["https://accounts.google.com", "accounts.google.com"])
+            claims: dict[str, Any] = jwt.decode(token, key, algorithms=["RS256"], audience=self.audiences, issuer=["https://accounts.google.com", "accounts.google.com"])
         except Exception as exc:
             # Do not log credentials or claims. This is enough to distinguish
             # audience, expiry, signature and malformed-token failures.

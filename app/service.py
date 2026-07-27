@@ -193,7 +193,10 @@ class WikiService:
     def activity(self, tenant_id: str, limit: int) -> dict[str, object]:
         return {"entries": self._activity_entries(tenant_id)[:limit]}
 
-    def list_documents(self, tenant_id: str, client_id: str | None, project_id: str | None) -> dict[str, object]:
+    def list_documents(
+        self, tenant_id: str, client_id: str | None, project_id: str | None, *,
+        document_types: set[str] | None = None, limit: int | None = None, offset: int = 0,
+    ) -> dict[str, object]:
         if not client_id or not project_id:
             raise ValueError("client_id and project_id are required for user-facing project files")
         source_prefix = f"sources/{tenant_id}/{client_id}/{project_id}/"
@@ -238,7 +241,9 @@ class WikiService:
                 })
         if not items:
             raise ObjectNotFound(source_prefix)
-        return {"items": items}
+        selected = [item for item in items if not document_types or item["type"] in document_types]
+        page = selected[offset:] if limit is None else selected[offset:offset + limit]
+        return {"total": len(selected), "items": page, "limit": limit, "offset": offset}
 
     def read_document(self, tenant_id: str, client_id: str | None, project_id: str | None, document: str) -> dict[str, object]:
         if not client_id or not project_id:
