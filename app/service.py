@@ -156,7 +156,7 @@ class WikiService:
         obj = self.storage.get_text(key)
         return {"scope": scope, "key": key, "index_markdown": obj.text, "children": markdown_links(obj.text)}
 
-    def logs(self, tenant_id: str, limit: int) -> dict[str, object]:
+    def logs(self, tenant_id: str, limit: int | None) -> dict[str, object]:
         key = f"wiki/{tenant_id}/log.md"
         text = self.storage.get_text(key).text
         entries = [line for line in text.splitlines() if line.startswith("- `")]
@@ -497,10 +497,29 @@ class WikiService:
         return [key for key in keys if key.startswith(prefix) and len(key.split("/")) == 5 and key.endswith("/index.md")]
 
     def _activity_entries(self, tenant_id: str) -> list[dict[str, str]]:
-        try: entries = self.logs(tenant_id, 500)["entries"]
-        except ObjectNotFound: return []
-        pattern = re.compile(r"^- `([^`]+)` ingest: `/?([^`]+)` \(client=([^,]+), project=([^;]+);")
-        return [{"timestamp": match.group(1), "event": "ingest", "source_key": match.group(2), "client_id": match.group(3), "project_id": match.group(4), "raw": entry} for entry in entries if (match := pattern.match(entry))]
+        try:
+            entries = self.logs(tenant_id, None)["entries"]
+        except ObjectNotFound:
+            return []
+        pattern = re.compile(r"^- `([^`]+)` (ingest|provenance|librarian): `/?([^`]+)` \(client=([^,]+), project=([^;]+);")
+        activity = []
+        for entry in entries:
+            match = pattern.match(entry)
+            if not match:
+                continue
+            try:
+                timestamp = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if timestamp.tzinfo is None:
+                continue
+            activity.append({
+                "timestamp": timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "event": match.group(2), "source_key": match.group(3),
+                "client_id": match.group(4), "project_id": match.group(5), "raw": entry,
+            })
+        activity.sort(key=lambda item: datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")), reverse=True)
+        return activity
 
     @staticmethod
     def _last_activity(entries: list[dict[str, str]], client_id: str, project_id: str | None = None) -> str | None:
