@@ -29,6 +29,10 @@ def test_api_requires_bearer_token() -> None:
 def test_guest_cannot_access_another_tenant() -> None:
     client = TestClient(create_app(identity=Identity(), verifier=Verifier()), headers={"Authorization": "Bearer valid"})
     assert client.get("/api/v1/dashboard/private/summary").status_code == 403
+    assert client.get(
+        "/api/v1/wiki/private/documents/analysis:meeting/raw",
+        params={"client_id": "client-1", "project_id": "project_1"},
+    ).status_code == 403
 
 
 def test_google_verifier_accepts_configured_audience_list(monkeypatch: pytest.MonkeyPatch) -> None:
