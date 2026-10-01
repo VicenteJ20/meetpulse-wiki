@@ -390,3 +390,15 @@ def test_project_activity_survives_more_than_500_other_events() -> None:
     storage.objects["wiki/tenant_1/log.md"] = ("# Activity\n## 2026-09-30\n" + "\n".join([newer] * 501 + [old]), "test-log")
     project = client.get("/api/v1/dashboard/tenant_1/clients/client-1/projects").json()["items"][0]
     assert project["last_activity_at"] == "2026-09-28T20:01:30Z"
+
+
+def test_ingest_normalizes_client_and_project_labels():
+    client, storage = api()
+    response = ingest(client, client_id=" CLIENT One ", project_id=" Project Two ")
+    assert response.status_code == 201
+    key = response.json()["source_key"]
+    assert key.startswith("sources/tenant_1/client-one/project-two/")
+    clients = client.get("/api/v1/dashboard/tenant_1/clients").json()["items"]
+    assert [c["client_id"] for c in clients] == ["client-one"]
+    projects = client.get("/api/v1/dashboard/tenant_1/clients/CLIENT%20One/projects").json()["items"]
+    assert [p["project_id"] for p in projects] == ["project-two"]

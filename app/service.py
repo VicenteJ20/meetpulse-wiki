@@ -4,7 +4,7 @@ import re
 from datetime import UTC, datetime
 from hashlib import sha256
 
-from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, parse_front_matter, project_index, slugify, split_front_matter, tenant_index, validate_meeting_analysis, validate_okf_document
+from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, parse_front_matter, project_index, slugify, split_front_matter, tenant_index, normalize_scope_identifier, validate_meeting_analysis, validate_okf_document
 from app.storage import ObjectNotFound, ObjectStorage, PreconditionFailed, StorageError
 
 
@@ -489,12 +489,12 @@ class WikiService:
     @staticmethod
     def _client_ids(tenant_id: str, keys: list[str]) -> list[str]:
         prefix = f"wiki/{tenant_id}/"
-        return sorted({key.split("/")[2] for key in keys if key.startswith(prefix) and len(key.split("/")) == 4 and key.endswith("/index.md")})
+        return sorted({key.split("/")[2] for key in keys if key.startswith(prefix) and len(key.split("/")) == 4 and key.endswith("/index.md") and key.split("/")[2] == normalize_scope_identifier(key.split("/")[2], "client_id")})
 
     @staticmethod
     def _project_index_keys(tenant_id: str, keys: list[str], client_id: str | None = None) -> list[str]:
         prefix = f"wiki/{tenant_id}/{client_id}/" if client_id else f"wiki/{tenant_id}/"
-        return [key for key in keys if key.startswith(prefix) and len(key.split("/")) == 5 and key.endswith("/index.md")]
+        return [key for key in keys if key.startswith(prefix) and len(key.split("/")) == 5 and key.endswith("/index.md") and key.split("/")[2] == normalize_scope_identifier(key.split("/")[2], "client_id") and key.split("/")[3] == normalize_scope_identifier(key.split("/")[3], "project_id")]
 
     def _activity_entries(self, tenant_id: str) -> list[dict[str, str]]:
         try:
@@ -509,6 +509,8 @@ class WikiService:
                 continue
             try:
                 timestamp = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+                client_id = normalize_scope_identifier(match.group(4), "client_id")
+                project_id = normalize_scope_identifier(match.group(5), "project_id")
             except ValueError:
                 continue
             if timestamp.tzinfo is None:
@@ -516,7 +518,7 @@ class WikiService:
             activity.append({
                 "timestamp": timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
                 "event": match.group(2), "source_key": match.group(3),
-                "client_id": match.group(4), "project_id": match.group(5), "raw": entry,
+                "client_id": client_id, "project_id": project_id, "raw": entry,
             })
         activity.sort(key=lambda item: datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")), reverse=True)
         return activity

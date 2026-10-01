@@ -132,6 +132,11 @@ async function processSource(event: R2Notification, deliveryAttempts: number, en
   if (event.action !== "PutObject" && event.action !== "CompleteMultipartUpload" && event.action !== "CopyObject") return;
   const scope = parseSourceKey(event.object.key);
   if (!scope) return;
+  // Retained legacy paths are read-only; canonical data owns future processing.
+  if (scope.client !== scope.client.toLowerCase() || scope.project !== scope.project.toLowerCase()) return;
+  // Historical consolidation imports must never rewrite current project context.
+  const imported = await env.WIKI_BUCKET.head(event.object.key);
+  if (imported?.customMetadata?.["consolidation-import"] === "1") return;
   const jobId = await sha256Hex(event.object.key).then((value) => value.slice(0, 32));
   await ensureJob(jobId, event.object.key, scope, env);
   const job = await env.DB.prepare("SELECT status,analysis_payload FROM librarian_jobs WHERE job_id=?").bind(jobId).first<{ status: string; analysis_payload: string | null }>();

@@ -41,6 +41,13 @@ def validate_identifier(value: str, field_name: str) -> str:
     return value
 
 
+def normalize_scope_identifier(value: str, field_name: str) -> str:
+    # Scope labels may contain spaces and accents, but never path components.
+    if not value.strip() or any(c in value for c in ("/", "\\", ".")):
+        raise ValueError(f"{field_name} must be a client or project identifier")
+    return validate_identifier(slugify(value.strip()), field_name)
+
+
 def slugify(title: str) -> str:
     normalized = unicodedata.normalize("NFKD", title).lower()
     normalized = "".join(c for c in normalized if not unicodedata.combining(c))

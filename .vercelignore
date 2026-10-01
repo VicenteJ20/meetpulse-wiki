@@ -16,3 +16,5 @@ docs/
 scripts/
 migrations/
 *.log
+
+.consolidation-backups/
