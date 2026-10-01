@@ -8,3 +8,5 @@ node_modules/
 .dev.vars
 .vercel/
 .env.local
+
+.consolidation-backups/

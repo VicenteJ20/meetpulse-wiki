@@ -8,7 +8,7 @@ import re
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.content import validate_identifier
+from app.content import normalize_scope_identifier, validate_identifier
 from app.service import ContextConflict, SourceAlreadyExists, WikiService
 from app.storage import ObjectNotFound, ObjectStorage, R2Storage, StorageError
 from app.auth import GoogleTokenVerifier
@@ -104,7 +104,7 @@ def create_app(
 
     def identifier(value: str, field: str) -> str:
         try:
-            return validate_identifier(value, field)
+            return normalize_scope_identifier(value, field) if field in {"client_id", "project_id"} else validate_identifier(value, field)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

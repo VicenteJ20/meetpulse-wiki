@@ -4,7 +4,7 @@ import re
 from datetime import UTC, datetime
 from hashlib import sha256
 
-from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, parse_front_matter, project_index, slugify, split_front_matter, tenant_index, validate_meeting_analysis, validate_okf_document
+from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, parse_front_matter, project_index, slugify, split_front_matter, tenant_index, normalize_scope_identifier, validate_meeting_analysis, validate_okf_document
 from app.storage import ObjectNotFound, ObjectStorage, PreconditionFailed, StorageError
 
 
@@ -156,7 +156,7 @@ class WikiService:
         obj = self.storage.get_text(key)
         return {"scope": scope, "key": key, "index_markdown": obj.text, "children": markdown_links(obj.text)}
 
-    def logs(self, tenant_id: str, limit: int) -> dict[str, object]:
+    def logs(self, tenant_id: str, limit: int | None) -> dict[str, object]:
         key = f"wiki/{tenant_id}/log.md"
         text = self.storage.get_text(key).text
         entries = [line for line in text.splitlines() if line.startswith("- `")]
@@ -165,12 +165,15 @@ class WikiService:
 
     def dashboard_summary(self, tenant_id: str) -> dict[str, object]:
         wiki_keys, source_keys = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/")
+        wiki_keys = self._canonical_scope_keys(wiki_keys)
+        source_keys = self._canonical_scope_keys(source_keys)
         events = self._activity_entries(tenant_id)
         knowledge_pages = [key for key in wiki_keys if key.endswith(".md") and (key.endswith("/context.md") or "/decisions/" in key or "/risks/" in key)]
         return {"tenant_id": tenant_id, "client_count": len(self._client_ids(tenant_id, wiki_keys)), "project_count": len(self._project_index_keys(tenant_id, wiki_keys)), "source_count": len([key for key in source_keys if key.endswith(".md")]), "wiki_page_count": len([key for key in source_keys if key.endswith(".md")]) + len(knowledge_pages), "last_activity_at": events[0]["timestamp"] if events else None}
 
     def dashboard_clients(self, tenant_id: str, limit: int, offset: int) -> dict[str, object]:
         wiki_keys, source_keys, events = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/"), self._activity_entries(tenant_id)
+        source_keys = self._canonical_scope_keys(source_keys)
         clients = []
         for client_id in self._client_ids(tenant_id, wiki_keys):
             projects = self._project_index_keys(tenant_id, wiki_keys, client_id)
@@ -487,20 +490,53 @@ class WikiService:
         return obj.last_modified.isoformat().replace("+00:00", "Z") if obj.last_modified else None
 
     @staticmethod
+    def _canonical_scope_keys(keys: list[str]) -> list[str]:
+        result = []
+        for key in keys:
+            parts = key.split("/")
+            if len(parts) >= 4 and parts[2] != normalize_scope_identifier(parts[2], "client_id"):
+                continue
+            if len(parts) >= 5 and parts[3] != normalize_scope_identifier(parts[3], "project_id"):
+                continue
+            result.append(key)
+        return result
+
+    @staticmethod
     def _client_ids(tenant_id: str, keys: list[str]) -> list[str]:
         prefix = f"wiki/{tenant_id}/"
-        return sorted({key.split("/")[2] for key in keys if key.startswith(prefix) and len(key.split("/")) == 4 and key.endswith("/index.md")})
+        return sorted({key.split("/")[2] for key in keys if key.startswith(prefix) and len(key.split("/")) == 4 and key.endswith("/index.md") and key.split("/")[2] == normalize_scope_identifier(key.split("/")[2], "client_id")})
 
     @staticmethod
     def _project_index_keys(tenant_id: str, keys: list[str], client_id: str | None = None) -> list[str]:
         prefix = f"wiki/{tenant_id}/{client_id}/" if client_id else f"wiki/{tenant_id}/"
-        return [key for key in keys if key.startswith(prefix) and len(key.split("/")) == 5 and key.endswith("/index.md")]
+        return [key for key in keys if key.startswith(prefix) and len(key.split("/")) == 5 and key.endswith("/index.md") and key.split("/")[2] == normalize_scope_identifier(key.split("/")[2], "client_id") and key.split("/")[3] == normalize_scope_identifier(key.split("/")[3], "project_id")]
 
     def _activity_entries(self, tenant_id: str) -> list[dict[str, str]]:
-        try: entries = self.logs(tenant_id, 500)["entries"]
-        except ObjectNotFound: return []
-        pattern = re.compile(r"^- `([^`]+)` ingest: `/?([^`]+)` \(client=([^,]+), project=([^;]+);")
-        return [{"timestamp": match.group(1), "event": "ingest", "source_key": match.group(2), "client_id": match.group(3), "project_id": match.group(4), "raw": entry} for entry in entries if (match := pattern.match(entry))]
+        try:
+            entries = self.logs(tenant_id, None)["entries"]
+        except ObjectNotFound:
+            return []
+        pattern = re.compile(r"^- `([^`]+)` (ingest|provenance|librarian): `/?([^`]+)` \(client=([^,]+), project=([^;]+);")
+        activity = []
+        for entry in entries:
+            match = pattern.match(entry)
+            if not match:
+                continue
+            try:
+                timestamp = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+                client_id = normalize_scope_identifier(match.group(4), "client_id")
+                project_id = normalize_scope_identifier(match.group(5), "project_id")
+            except ValueError:
+                continue
+            if timestamp.tzinfo is None:
+                continue
+            activity.append({
+                "timestamp": timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                "event": match.group(2), "source_key": match.group(3),
+                "client_id": client_id, "project_id": project_id, "raw": entry,
+            })
+        activity.sort(key=lambda item: datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")), reverse=True)
+        return activity
 
     @staticmethod
     def _last_activity(entries: list[dict[str, str]], client_id: str, project_id: str | None = None) -> str | None:
