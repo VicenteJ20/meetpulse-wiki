@@ -165,12 +165,15 @@ class WikiService:
 
     def dashboard_summary(self, tenant_id: str) -> dict[str, object]:
         wiki_keys, source_keys = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/")
+        wiki_keys = self._canonical_scope_keys(wiki_keys)
+        source_keys = self._canonical_scope_keys(source_keys)
         events = self._activity_entries(tenant_id)
         knowledge_pages = [key for key in wiki_keys if key.endswith(".md") and (key.endswith("/context.md") or "/decisions/" in key or "/risks/" in key)]
         return {"tenant_id": tenant_id, "client_count": len(self._client_ids(tenant_id, wiki_keys)), "project_count": len(self._project_index_keys(tenant_id, wiki_keys)), "source_count": len([key for key in source_keys if key.endswith(".md")]), "wiki_page_count": len([key for key in source_keys if key.endswith(".md")]) + len(knowledge_pages), "last_activity_at": events[0]["timestamp"] if events else None}
 
     def dashboard_clients(self, tenant_id: str, limit: int, offset: int) -> dict[str, object]:
         wiki_keys, source_keys, events = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/"), self._activity_entries(tenant_id)
+        source_keys = self._canonical_scope_keys(source_keys)
         clients = []
         for client_id in self._client_ids(tenant_id, wiki_keys):
             projects = self._project_index_keys(tenant_id, wiki_keys, client_id)
@@ -485,6 +488,18 @@ class WikiService:
     @staticmethod
     def _updated_at(obj) -> str | None:
         return obj.last_modified.isoformat().replace("+00:00", "Z") if obj.last_modified else None
+
+    @staticmethod
+    def _canonical_scope_keys(keys: list[str]) -> list[str]:
+        result = []
+        for key in keys:
+            parts = key.split("/")
+            if len(parts) >= 4 and parts[2] != normalize_scope_identifier(parts[2], "client_id"):
+                continue
+            if len(parts) >= 5 and parts[3] != normalize_scope_identifier(parts[3], "project_id"):
+                continue
+            result.append(key)
+        return result
 
     @staticmethod
     def _client_ids(tenant_id: str, keys: list[str]) -> list[str]:

@@ -402,3 +402,16 @@ def test_ingest_normalizes_client_and_project_labels():
     assert [c["client_id"] for c in clients] == ["client-one"]
     projects = client.get("/api/v1/dashboard/tenant_1/clients/CLIENT%20One/projects").json()["items"]
     assert [p["project_id"] for p in projects] == ["project-two"]
+
+
+def test_dashboard_does_not_count_retained_legacy_copies_twice():
+    client, storage = api()
+    ingest(client)
+    copies = [(k, v) for k, v in storage.objects.items() if "/client-1/" in k]
+    for key, value in copies:
+        storage.objects[key.replace("/client-1/", "/Client-1/")] = value
+    summary = client.get("/api/v1/dashboard/tenant_1/summary").json()
+    assert summary["client_count"] == 1
+    assert summary["project_count"] == 1
+    assert summary["source_count"] == 1
+    assert summary["wiki_page_count"] == 2
