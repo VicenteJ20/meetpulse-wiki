@@ -206,14 +206,15 @@ class WikiService:
                 obj = self.storage.get_text(key)
                 metadata, body = parse_front_matter(obj.text)
                 stem = key.rsplit("/", 1)[-1].removesuffix(".md")
-                raw_sources = metadata.get("raw_sources") if isinstance(metadata.get("raw_sources"), list) else []
+                raw_files = self._transcript_names(tenant_id, client_id, project_id, metadata.get("raw_sources"))
                 items.append({
                     "document": f"analysis:{stem}", "title": metadata.get("title") or self._analysis_title(stem),
                     "key": key, "updated_at": self._updated_at(obj), "type": "meeting",
                     "description": metadata.get("description") or self._markdown_snippet(body),
                     "source_kind": metadata.get("source_kind", "meeting_analysis"),
                     "provenance_status": metadata.get("provenance_status", "analysis_only"),
-                    "raw_available": bool(raw_sources),
+                    "raw_available": bool(raw_files),
+                    "raw_files": raw_files,
                 })
         context_key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"
         try:
@@ -272,9 +273,85 @@ class WikiService:
             "content_type": "text/markdown", "updated_at": self._updated_at(obj),
         }
         if is_analysis:
-            raw_sources = metadata.get("raw_sources") if isinstance(metadata.get("raw_sources"), list) else []
-            response.update({"source_kind": metadata.get("source_kind", "meeting_analysis"), "provenance_status": metadata.get("provenance_status", "analysis_only"), "raw_available": bool(raw_sources)})
+            raw_files = self._transcript_names(tenant_id, client_id, project_id, metadata.get("raw_sources"))
+            response.update({
+                "source_kind": metadata.get("source_kind", "meeting_analysis"),
+                "provenance_status": metadata.get("provenance_status", "analysis_only"),
+                "raw_available": bool(raw_files),
+                "raw_files": raw_files,
+            })
         return response
+
+    def read_transcript(self, tenant_id: str, client_id: str | None, project_id: str | None, document: str, file: str | None) -> dict[str, object]:
+        if not client_id or not project_id:
+            raise ValueError("client_id and project_id are required for user-facing project files")
+        if not document.startswith("analysis:"):
+            raise ValueError("raw transcript is only available for a meeting analysis")
+        stem = document.removeprefix("analysis:")
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", stem):
+            raise ValueError("invalid analysis document")
+        source_key = f"sources/{tenant_id}/{client_id}/{project_id}/{stem}.md"
+        metadata, _ = parse_front_matter(self.storage.get_text(source_key).text)
+        transcripts = self._transcripts(tenant_id, client_id, project_id, metadata.get("raw_sources"))
+        if not transcripts:
+            return {
+                "document": document, "provenance_status": "analysis_only", "raw_available": False,
+                "file": None, "files": [], "content_text": None,
+            }
+        if file is None:
+            if len(transcripts) != 1:
+                raise ValueError("file is required when the meeting has more than one transcript")
+            name, raw_key = transcripts[0]
+        else:
+            if not self._is_transcript_filename(file):
+                raise ValueError("invalid transcript file")
+            match = next((item for item in transcripts if item[0] == file), None)
+            if match is None:
+                raise ObjectNotFound(file)
+            name, raw_key = match
+        stored = self.storage.get_bytes(raw_key)
+        try:
+            text = stored.data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("transcript must be UTF-8") from exc
+        return {
+            "document": document,
+            "provenance_status": metadata.get("provenance_status", "complete"),
+            "raw_available": True,
+            "file": name,
+            "files": [item[0] for item in transcripts],
+            "content_text": text,
+            "content_type": stored.content_type or "text/plain; charset=utf-8",
+        }
+
+    def _transcript_names(self, tenant_id: str, client_id: str, project_id: str, raw_sources: object) -> list[str]:
+        return [name for name, _key in self._transcripts(tenant_id, client_id, project_id, raw_sources)]
+
+    def _transcripts(self, tenant_id: str, client_id: str, project_id: str, raw_sources: object) -> list[tuple[str, str]]:
+        prefix = f"raw/{tenant_id}/{client_id}/{project_id}/"
+        sources = raw_sources if isinstance(raw_sources, list) else []
+        candidates: list[tuple[str, str]] = []
+        for raw_key in sources:
+            if not isinstance(raw_key, str) or not raw_key.startswith(prefix):
+                continue
+            relative = raw_key[len(prefix):]
+            parts = relative.split("/")
+            if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+                continue
+            candidates.append((parts[-1], raw_key))
+        transcripts: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for name, raw_key in candidates:
+            public = name if sum(item[0] == name for item in candidates) == 1 else raw_key[len(prefix):]
+            if public in seen:
+                continue
+            seen.add(public)
+            transcripts.append((public, raw_key))
+        return transcripts
+
+    @staticmethod
+    def _is_transcript_filename(name: str) -> bool:
+        return bool(name) and "\\" not in name and ".." not in name.split("/") and all(part not in {"", ".", ".."} for part in name.split("/"))
 
     def update_context(self, tenant_id: str, client_id: str, project_id: str, content_markdown: str) -> dict[str, object]:
         key = f"wiki/{tenant_id}/{client_id}/{project_id}/context.md"

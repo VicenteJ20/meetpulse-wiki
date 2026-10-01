@@ -226,6 +226,61 @@ def test_dashboard_and_document_reading() -> None:
     assert context["metadata"]["type"] == "context"
 
 
+def test_read_transcript_returns_only_raw_cited_by_the_analysis() -> None:
+    client, storage = api()
+    raw = "Speaker A: evidencia primaria.\n".encode()
+    assert ingest(client, raw=raw).status_code == 201
+    scope = {"client_id": "client-1", "project_id": "project_1"}
+    document = "analysis:2026-07-12-reunion-de-diseno"
+    meeting = client.get(f"/api/v1/wiki/tenant_1/documents/{document}", params=scope)
+    assert meeting.status_code == 200
+    assert meeting.json()["raw_available"] is True and meeting.json()["raw_files"] == ["transcript.txt"]
+
+    transcript = client.get(f"/api/v1/wiki/tenant_1/documents/{document}/raw", params=scope)
+    assert transcript.status_code == 200
+    assert transcript.json()["content_text"] == raw.decode() and transcript.json()["file"] == "transcript.txt"
+
+    orphan = "raw/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno/orphan.txt"
+    storage.put_bytes_if_absent(orphan, b"not cited", content_type="text/plain", sha256_hex="unused")
+    missing = client.get(f"/api/v1/wiki/tenant_1/documents/{document}/raw", params={**scope, "file": "orphan.txt"})
+    assert missing.status_code == 404
+    assert storage.binary_objects[orphan][0] == b"not cited"
+
+
+def test_analysis_without_raw_does_not_read_loose_transcripts() -> None:
+    client, storage = api()
+    assert ingest(client).status_code == 201
+    loose = "raw/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno/transcript.txt"
+    storage.put_bytes_if_absent(loose, b"loose", content_type="text/plain", sha256_hex="unused")
+    response = client.get(
+        "/api/v1/wiki/tenant_1/documents/analysis:2026-07-12-reunion-de-diseno/raw",
+        params={"client_id": "client-1", "project_id": "project_1", "file": "transcript.txt"},
+    )
+    assert response.status_code == 200
+    assert response.json()["provenance_status"] == "analysis_only" and response.json()["content_text"] is None
+    assert storage.binary_objects[loose][0] == b"loose"
+
+
+def test_multiple_transcripts_require_the_cited_filename() -> None:
+    client, storage = api()
+    assert ingest(client, raw=b"first").status_code == 201
+    source_key = "sources/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno.md"
+    text, etag = storage.objects[source_key]
+    second = "raw/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno/notes.md"
+    storage.put_bytes_if_absent(second, "segunda".encode(), content_type="text/markdown", sha256_hex="unused")
+    storage.objects[source_key] = (text.replace("raw_sources:\n- raw/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno/transcript.txt", "raw_sources:\n- raw/tenant_1/client-1/project_1/2026-07-12-reunion-de-diseno/transcript.txt\n- " + second), etag)
+    endpoint = "/api/v1/wiki/tenant_1/documents/analysis:2026-07-12-reunion-de-diseno/raw"
+    scope = {"client_id": "client-1", "project_id": "project_1"}
+    assert client.get(endpoint, params=scope).status_code == 422
+    chosen = client.get(endpoint, params={**scope, "file": "notes.md"})
+    assert chosen.status_code == 200 and chosen.json()["content_text"] == "segunda"
+    outside = "raw/other-tenant/client-1/project_1/secret.txt"
+    storage.put_bytes_if_absent(outside, b"secret", content_type="text/plain", sha256_hex="unused")
+    smuggled, etag = storage.objects[source_key]
+    storage.objects[source_key] = (smuggled.replace(second, second + "\n- " + outside), etag)
+    assert client.get(endpoint, params={**scope, "file": "secret.txt"}).status_code == 404
+
+
 def test_document_listing_supports_filters_and_pagination() -> None:
     client, _ = api(); assert ingest(client).status_code == 201
     assert ingest(client, title="Second meeting").status_code == 201

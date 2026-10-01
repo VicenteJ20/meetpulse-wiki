@@ -312,6 +312,25 @@ def create_app(
         except StorageError as exc:
             raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
 
+    @app.get("/api/v1/wiki/{tenant_id}/documents/{document}/raw")
+    def read_transcript(
+        request: Request, tenant_id: str, document: str, client_id: str | None = None,
+        project_id: str | None = None, file: str | None = None,
+    ) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        if client_id:
+            client_id = identifier(client_id, "client_id")
+        if project_id:
+            project_id = identifier(project_id, "project_id")
+        try:
+            return service(request).read_transcript(tenant_id, client_id, project_id, document, file)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ObjectNotFound as exc:
+            raise HTTPException(status_code=404, detail={"key": str(exc)}) from exc
+        except StorageError as exc:
+            raise HTTPException(status_code=502, detail="R2 storage operation failed") from exc
+
     @app.get("/api/v1/wiki/{tenant_id}/documents/{document}")
     def read_document(request: Request, tenant_id: str, document: str, client_id: str | None = None, project_id: str | None = None) -> dict[str, object]:
         tenant_id = identifier(tenant_id, "tenant_id")

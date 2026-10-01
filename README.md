@@ -36,7 +36,8 @@ Clara consume exclusivamente los endpoints de lectura de esta API con el ID toke
 - `GET /api/v1/dashboard/{tenant_id}/clients/{client_id}/projects`: proyectos del cliente y sus contadores.
 - `GET /api/v1/dashboard/{tenant_id}/activity?limit=20`: eventos de ingesta listos para una vista de actividad.
 - `GET /api/v1/wiki/{tenant_id}/documents?client_id=&project_id=&document_type=&limit=&offset=`: documentos disponibles, con filtros de tipo y paginación opcionales.
-- `GET /api/v1/wiki/{tenant_id}/documents/{document}?client_id=&project_id=`: contenido Markdown de una fuente de análisis o del contexto de proyecto.
+- `GET /api/v1/wiki/{tenant_id}/documents/{document}?client_id=&project_id=`: contenido Markdown de una fuente de análisis o del contexto de proyecto. En un análisis, `raw_files` lista los nombres de las transcripciones, sin sus claves de almacenamiento.
+- `GET /api/v1/wiki/{tenant_id}/documents/analysis:{stem}/raw?client_id=&project_id=&file=`: texto UTF-8 de una transcripción citada por ese análisis. `file` es el nombre devuelto en `raw_files` y solo hace falta cuando hay más de una. Si el análisis no tiene RAW, responde `provenance_status: analysis_only`.
 - `PUT /api/v1/wiki/{tenant_id}/documents/context?client_id=&project_id=`: actualiza el contexto con un documento OKF completo en `content_markdown`.
 - `GET /api/v1/jobs/{tenant_id}/{job_id}`: estado de un trabajo del Bibliotecario.
 - `GET /api/v1/jobs/{tenant_id}?client_id=&project_id=&limit=`: trabajos recientes del alcance seleccionado.
