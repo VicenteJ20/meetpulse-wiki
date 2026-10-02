@@ -375,21 +375,22 @@ def test_dashboard_activity_includes_processing_and_sorts_appended_events() -> N
         summary = client.get("/api/v1/dashboard/tenant_1/summary").json()
         clients = client.get("/api/v1/dashboard/tenant_1/clients").json()["items"]
         projects = client.get("/api/v1/dashboard/tenant_1/clients/client-1/projects").json()["items"]
-        assert summary["last_activity_at"] == "2026-10-01T01:00:00Z"
-        assert clients[0]["last_activity_at"] == "2026-10-01T01:00:00Z"
-        assert next(p for p in projects if p["project_id"] == "project_1")["last_activity_at"] == "2026-09-30T19:59:07Z"
+        meeting_at = "2026-07-12T19:30:00Z"
+        assert summary["last_activity_at"] == meeting_at
+        assert clients[0]["last_activity_at"] == meeting_at
+        assert next(p for p in projects if p["project_id"] == "project_1")["last_activity_at"] == meeting_at
+        assert next(p for p in projects if p["project_id"] == "other-project")["last_activity_at"] == meeting_at
         activity = client.get("/api/v1/dashboard/tenant_1/activity").json()["entries"]
         assert [event["event"] for event in activity] == ["provenance", "librarian", "ingest"]
 
 
-def test_project_activity_survives_more_than_500_other_events() -> None:
+def test_project_last_update_follows_the_meeting_instant() -> None:
     client, storage = api()
     ingest(client)
-    old = "- `2026-09-28T20:01:30Z` ingest: `/sources/tenant_1/client-1/project_1/meeting.md` (client=client-1, project=project_1; wiki=)"
-    newer = "- `2026-09-30T19:59:07Z` librarian: `/sources/tenant_1/other-client/other-project/meeting.md` (client=other-client, project=other-project; outputs=)"
-    storage.objects["wiki/tenant_1/log.md"] = ("# Activity\n## 2026-09-30\n" + "\n".join([newer] * 501 + [old]), "test-log")
+    newer = "- `2026-10-01T01:00:00Z` librarian: `/sources/tenant_1/client-1/project_1/meeting.md` (client=client-1, project=project_1; outputs=)"
+    storage.objects["wiki/tenant_1/log.md"] = ("# Activity\n## 2026-10-01\n" + "\n".join([newer] * 501), "test-log")
     project = client.get("/api/v1/dashboard/tenant_1/clients/client-1/projects").json()["items"][0]
-    assert project["last_activity_at"] == "2026-09-28T20:01:30Z"
+    assert project["last_activity_at"] == "2026-07-12T19:30:00Z"
 
 
 def test_ingest_normalizes_client_and_project_labels():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 import logging
 import re
@@ -9,13 +9,17 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, Up
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.content import normalize_scope_identifier, validate_identifier
-from app.service import ContextConflict, SourceAlreadyExists, WikiService
+from app.service import ContextConflict, SourceAlreadyExists, WikiService, WorkStoreRequired
 from app.storage import ObjectNotFound, ObjectStorage, R2Storage, StorageError
 from app.auth import GoogleTokenVerifier
 from app.config import CorsSettings, Settings
 from app.identity import D1Store, IdentityStore, User
 from app.jobs import D1JobStore, JobStore, job_id_for_source
 from app.librarian import InvalidLibrarianSignature, verify_librarian_signature
+from app.work import (
+    D1WorkStore, NotAllowed, NotFound, RequestConflict, WorkStore, build_pending_view, build_week_view,
+    public_commitment, validate_due, validate_timezone, validate_week, week_of, NOTE_BODY_LIMIT, REQUEST_RE,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +30,7 @@ def create_app(
     identity: IdentityStore | None = None,
     verifier: GoogleTokenVerifier | None = None,
     jobs: JobStore | None = None,
+    work: WorkStore | None = None,
     *,
     require_raw_source: bool | None = None,
     librarian_secret: str | None = None,
@@ -34,13 +39,14 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CorsSettings().allowed_origins(),
-        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["content-type", "authorization"],
     )
     app.state.storage = storage
     app.state.identity = identity
     app.state.verifier = verifier
     app.state.jobs = jobs
+    app.state.work = work
     app.state.require_raw_source = require_raw_source
     app.state.librarian_secret = librarian_secret
 
@@ -89,6 +95,21 @@ def create_app(
         request.app.state.jobs = D1JobStore(active_identity)
         return request.app.state.jobs
 
+    def work_store(request: Request, *, required: bool) -> WorkStore | None:
+        if request.app.state.work is not None:
+            return request.app.state.work
+        active = request.app.state.identity
+        if active is None:
+            settings = Settings()
+            active = D1Store(settings.cloudflare_account_id, settings.cloudflare_d1_database_id, settings.cloudflare_d1_api_token)
+            request.app.state.identity = active
+        if not isinstance(active, D1Store):
+            if required:
+                raise HTTPException(status_code=503, detail="Work store is not configured")
+            return None
+        request.app.state.work = D1WorkStore(active)
+        return request.app.state.work
+
     def raw_is_required(request: Request) -> bool:
         configured = request.app.state.require_raw_source
         return Settings().require_raw_source if configured is None else configured
@@ -101,6 +122,57 @@ def create_app(
     def require_owner(request: Request, tenant_id: str) -> None:
         if identities(request).role_for(current_user(request), tenant_id) != "owner":
             raise HTTPException(status_code=403, detail="Only the tenant owner can manage users")
+
+    async def json_object(request: Request) -> dict:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Request body must be JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="Request body must be an object")
+        return payload
+
+    def checked_note_id(note_id: str) -> str:
+        if not re.fullmatch(r"[a-f0-9]{32}", note_id):
+            raise HTTPException(status_code=422, detail="invalid note id")
+        return note_id
+
+    def require_member(request: Request, tenant_id: str) -> None:
+        if identities(request).role_for(current_user(request), tenant_id) is None:
+            raise HTTPException(status_code=403, detail="You do not have access to this tenant")
+
+    def scope_exists(request: Request, tenant_id: str, client_id: str | None, project_id: str | None) -> None:
+        if project_id and not client_id:
+            raise HTTPException(status_code=422, detail="client_id is required when project_id is provided")
+        if not client_id:
+            return
+        wiki = service(request)
+        if project_id:
+            prefixes = (f"wiki/{tenant_id}/{client_id}/{project_id}/", f"sources/{tenant_id}/{client_id}/{project_id}/")
+        else:
+            prefixes = (f"wiki/{tenant_id}/{client_id}/", f"sources/{tenant_id}/{client_id}/")
+        if not any(wiki.storage.list_keys(prefix) for prefix in prefixes):
+            raise HTTPException(status_code=422, detail="client or project does not exist")
+
+    def text_field(payload: dict, field: str, *, required: bool, limit: int) -> str | None:
+        if field not in payload or payload[field] is None:
+            if required:
+                raise HTTPException(status_code=422, detail=f"{field} is required")
+            return None
+        value = payload[field]
+        if not isinstance(value, str):
+            raise HTTPException(status_code=422, detail=f"{field} must be a string")
+        stripped = value.strip()
+        if required and not stripped:
+            raise HTTPException(status_code=422, detail=f"{field} is required")
+        if len(stripped) > limit:
+            raise HTTPException(status_code=422, detail=f"{field} is too long")
+        return stripped
+
+    def optional_scope(payload: dict, field: str) -> str | None:
+        if field not in payload or payload[field] in {None, ""}:
+            return None
+        return identifier(str(payload[field]), field)
 
     def identifier(value: str, field: str) -> str:
         try:
@@ -211,7 +283,11 @@ def create_app(
             for field in ("tenant_id", "client_id", "project_id"):
                 if field not in payload: raise ValueError(f"{field} is required")
                 payload[field] = validate_identifier(str(payload[field]), field)
-            return service(request).apply_librarian(payload)
+            commitments = payload.get("commitments") or []
+            store = work_store(request, required=bool(commitments))
+            return service(request).apply_librarian(payload, work=store)
+        except WorkStoreRequired as exc:
+            raise HTTPException(status_code=503, detail="Work store is not configured") from exc
         except ContextConflict as exc:
             raise HTTPException(status_code=409, detail={"context_key": str(exc)}) from exc
         except (ValueError, KeyError) as exc:
@@ -390,6 +466,255 @@ def create_app(
     @app.get("/api/v1/tenants")
     def list_tenants(request: Request) -> dict[str, object]:
         return {"items": identities(request).tenants_for(current_user(request))}
+
+    @app.get("/api/v1/me/settings")
+    def my_settings(request: Request) -> dict[str, object]:
+        store = work_store(request, required=True)
+        assert store is not None
+        return {"timezone": store.timezone_for(current_user(request).google_sub)}
+
+    @app.patch("/api/v1/me/settings")
+    async def update_my_settings(request: Request) -> dict[str, object]:
+        payload = await json_object(request)
+        try:
+            timezone = validate_timezone(str(payload.get("timezone", "")))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        store = work_store(request, required=True)
+        assert store is not None
+        return store.set_timezone(current_user(request).google_sub, timezone)
+
+    @app.get("/api/v1/me/week")
+    def my_week(request: Request, tenant_id: str = Query(...), week: str | None = None) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        require_member(request, tenant_id)
+        store = work_store(request, required=True)
+        assert store is not None
+        user = current_user(request)
+        timezone = store.timezone_for(user.google_sub)
+        try:
+            selected = validate_week(week) if week else week_of(datetime.now(UTC), timezone)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rows = [public_commitment(row, user.google_sub) for row in store.visible_commitments(tenant_id, user.google_sub, None)]
+        return {"tenant_id": tenant_id, **build_week_view(rows, timezone=timezone, week=selected)}
+
+    @app.get("/api/v1/tenants/{tenant_id}/pending")
+    def list_pending(request: Request, tenant_id: str, client_id: str | None = None) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        if client_id:
+            client_id = identifier(client_id, "client_id")
+        require_member(request, tenant_id)
+        store = work_store(request, required=True)
+        assert store is not None
+        user = current_user(request)
+        wiki = service(request)
+        rows = [public_commitment(row, user.google_sub) for row in store.visible_commitments(tenant_id, user.google_sub, client_id)]
+        return build_pending_view(
+            rows, tenant_id=tenant_id, timezone=store.timezone_for(user.google_sub), now=datetime.now(UTC),
+            client_id=client_id,
+            decision_digest=lambda client, project: wiki.decision_digest(tenant_id, client, project),
+            latest_meeting=lambda client, project: wiki._latest_meeting(tenant_id, client, project),
+        )
+
+    @app.post("/api/v1/tenants/{tenant_id}/commitments", status_code=201)
+    async def create_commitment(request: Request, tenant_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        require_member(request, tenant_id)
+        payload = await json_object(request)
+        title = text_field(payload, "title", required=True, limit=200)
+        detail = text_field(payload, "detail", required=False, limit=4000) or ""
+        client_id = optional_scope(payload, "client_id")
+        project_id = optional_scope(payload, "project_id")
+        scope_exists(request, tenant_id, client_id, project_id)
+        origin = payload.get("origin") or "manual"
+        if origin not in {"manual", "mcp"}:
+            raise HTTPException(status_code=422, detail="origin must be manual or mcp")
+        week = payload.get("week")
+        due_on = payload.get("due_on")
+        try:
+            if week not in {None, ""}:
+                week = validate_week(str(week))
+            else:
+                week = None
+            due_on = validate_due(None if due_on in {None, ""} else str(due_on))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        request_id = payload.get("client_request_id")
+        if request_id is not None and (not isinstance(request_id, str) or not REQUEST_RE.fullmatch(request_id)):
+            raise HTTPException(status_code=422, detail="client_request_id must be 8 to 80 letters, numbers, underscores or hyphens")
+        assignee = text_field(payload, "assignee_label", required=False, limit=120)
+        store = work_store(request, required=True)
+        assert store is not None
+        user = current_user(request)
+        try:
+            created = store.create_commitment(owner_sub=user.google_sub, tenant_id=tenant_id, fields={
+                "title": title, "detail": detail, "client_id": client_id, "project_id": project_id,
+                "week": week, "due_on": due_on, "origin": origin, "client_request_id": request_id,
+                "assignee_label": assignee,
+            })
+        except RequestConflict as exc:
+            raise HTTPException(status_code=409, detail="client_request_id was already used for a different commitment") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return public_commitment(created, user.google_sub)
+
+    @app.patch("/api/v1/tenants/{tenant_id}/commitments/{commitment_id}")
+    async def update_commitment(request: Request, tenant_id: str, commitment_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        if not re.fullmatch(r"[a-f0-9]{32}", commitment_id):
+            raise HTTPException(status_code=422, detail="invalid commitment id")
+        require_member(request, tenant_id)
+        payload = await json_object(request)
+        allowed = {"status", "week", "title", "detail", "client_id", "project_id", "due_on"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"unknown fields: {', '.join(sorted(unknown))}")
+        changes: dict[str, object] = {}
+        if "title" in payload:
+            changes["title"] = text_field(payload, "title", required=True, limit=200)
+        if "detail" in payload:
+            changes["detail"] = text_field(payload, "detail", required=False, limit=4000) or ""
+        if "status" in payload:
+            if payload["status"] not in {"open", "done", "dropped"}:
+                raise HTTPException(status_code=422, detail="status must be open, done, or dropped")
+            changes["status"] = payload["status"]
+        try:
+            if "week" in payload:
+                changes["week"] = validate_week(str(payload["week"]))
+            if "due_on" in payload:
+                changes["due_on"] = validate_due(None if payload["due_on"] in {None, ""} else str(payload["due_on"]))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if "client_id" in payload:
+            changes["client_id"] = optional_scope(payload, "client_id")
+        if "project_id" in payload:
+            changes["project_id"] = optional_scope(payload, "project_id")
+        store = work_store(request, required=True)
+        assert store is not None
+        user = current_user(request)
+        current = next((row for row in store.visible_commitments(tenant_id, user.google_sub, None) if row["id"] == commitment_id), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Commitment not found")
+        client_id = changes["client_id"] if "client_id" in changes else current.get("client_id")
+        project_id = changes["project_id"] if "project_id" in changes else current.get("project_id")
+        scope_exists(request, tenant_id, client_id if isinstance(client_id, str) else None, project_id if isinstance(project_id, str) else None)
+        try:
+            updated = store.update_commitment(actor_sub=user.google_sub, tenant_id=tenant_id, commitment_id=commitment_id, changes=changes)
+        except NotAllowed as exc:
+            raise HTTPException(status_code=403, detail="You cannot change another member's commitment") from exc
+        except NotFound as exc:
+            raise HTTPException(status_code=404, detail="Commitment not found") from exc
+        return public_commitment(updated, user.google_sub)
+
+    @app.post("/api/v1/tenants/{tenant_id}/notes", status_code=201)
+    async def create_note(request: Request, tenant_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        require_member(request, tenant_id)
+        payload = await json_object(request)
+        return save_note(request, tenant_id, payload, None)
+
+    @app.get("/api/v1/tenants/{tenant_id}/notes")
+    def list_notes(
+        request: Request, tenant_id: str, client_id: str | None = None, project_id: str | None = None,
+        q: str | None = None, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+    ) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        if client_id:
+            client_id = identifier(client_id, "client_id")
+        if project_id:
+            if not client_id:
+                raise HTTPException(status_code=422, detail="client_id is required when project_id is provided")
+            project_id = identifier(project_id, "project_id")
+        require_member(request, tenant_id)
+        if q is not None and not q.strip():
+            raise HTTPException(status_code=422, detail="q must not be empty")
+        store = work_store(request, required=True)
+        assert store is not None
+        return store.list_notes(
+            author_sub=current_user(request).google_sub, tenant_id=tenant_id, client_id=client_id,
+            project_id=project_id, query=q.strip() if q else None, limit=limit, offset=offset,
+        )
+
+    @app.get("/api/v1/tenants/{tenant_id}/notes/{note_id}")
+    def read_note(request: Request, tenant_id: str, note_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        require_member(request, tenant_id)
+        return load_note(request, tenant_id, note_id)
+
+    @app.patch("/api/v1/tenants/{tenant_id}/notes/{note_id}")
+    async def update_note(request: Request, tenant_id: str, note_id: str) -> dict[str, object]:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        require_member(request, tenant_id)
+        payload = await json_object(request)
+        return save_note(request, tenant_id, payload, note_id)
+
+    @app.delete("/api/v1/tenants/{tenant_id}/notes/{note_id}", status_code=204)
+    def delete_note(request: Request, tenant_id: str, note_id: str) -> None:
+        tenant_id = identifier(tenant_id, "tenant_id")
+        require_member(request, tenant_id)
+        store = work_store(request, required=True)
+        assert store is not None
+        try:
+            store.delete_note(author_sub=current_user(request).google_sub, tenant_id=tenant_id, note_id=checked_note_id(note_id))
+        except NotFound as exc:
+            raise HTTPException(status_code=404, detail="Note not found") from exc
+
+    def save_note(request: Request, tenant_id: str, payload: dict, note_id: str | None) -> dict[str, object]:
+        store = work_store(request, required=True)
+        assert store is not None
+        user = current_user(request)
+        if note_id is None:
+            body = text_field(payload, "body", required=True, limit=NOTE_BODY_LIMIT)
+            title = text_field(payload, "title", required=False, limit=200)
+            client_id = optional_scope(payload, "client_id")
+            project_id = optional_scope(payload, "project_id")
+            scope_exists(request, tenant_id, client_id, project_id)
+            source = payload.get("source") or "manual"
+            if source not in {"manual", "mcp"}:
+                raise HTTPException(status_code=422, detail="source must be manual or mcp")
+            if "pinned" in payload and not isinstance(payload["pinned"], bool):
+                raise HTTPException(status_code=422, detail="pinned must be a boolean")
+            request_id = payload.get("client_request_id")
+            if request_id is not None and (not isinstance(request_id, str) or not REQUEST_RE.fullmatch(request_id)):
+                raise HTTPException(status_code=422, detail="client_request_id must be 8 to 80 letters, numbers, underscores or hyphens")
+            try:
+                return store.create_note(author_sub=user.google_sub, tenant_id=tenant_id, fields={
+                    "title": title, "body": body, "client_id": client_id, "project_id": project_id,
+                    "pinned": bool(payload.get("pinned")), "source": source, "client_request_id": request_id,
+                })
+            except RequestConflict as exc:
+                raise HTTPException(status_code=409, detail="client_request_id was already used for a different note") from exc
+        changes: dict[str, object] = {}
+        allowed = {"title", "body", "client_id", "project_id", "pinned"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"unknown fields: {', '.join(sorted(unknown))}")
+        if "body" in payload:
+            changes["body"] = text_field(payload, "body", required=True, limit=NOTE_BODY_LIMIT)
+        if "title" in payload:
+            changes["title"] = text_field(payload, "title", required=False, limit=200)
+        if "pinned" in payload:
+            if not isinstance(payload["pinned"], bool):
+                raise HTTPException(status_code=422, detail="pinned must be a boolean")
+            changes["pinned"] = payload["pinned"]
+        if "client_id" in payload:
+            changes["client_id"] = optional_scope(payload, "client_id")
+        if "project_id" in payload:
+            changes["project_id"] = optional_scope(payload, "project_id")
+        current = load_note(request, tenant_id, note_id)
+        client_id = changes["client_id"] if "client_id" in changes else current.get("client_id")
+        project_id = changes["project_id"] if "project_id" in changes else current.get("project_id")
+        scope_exists(request, tenant_id, client_id if isinstance(client_id, str) else None, project_id if isinstance(project_id, str) else None)
+        return store.update_note(author_sub=user.google_sub, tenant_id=tenant_id, note_id=checked_note_id(note_id), changes=changes)
+
+    def load_note(request: Request, tenant_id: str, note_id: str) -> dict[str, object]:
+        store = work_store(request, required=True)
+        assert store is not None
+        try:
+            return store.get_note(author_sub=current_user(request).google_sub, tenant_id=tenant_id, note_id=checked_note_id(note_id))
+        except NotFound as exc:
+            raise HTTPException(status_code=404, detail="Note not found") from exc
 
     @app.get("/api/v1/me/invitations")
     def my_invitations(request: Request) -> dict[str, object]:

@@ -6,6 +6,7 @@ from hashlib import sha256
 
 from app.content import append_link, build_okf_document, build_source_markdown, client_index, log_header, markdown_links, parse_front_matter, project_index, slugify, split_front_matter, tenant_index, normalize_scope_identifier, validate_meeting_analysis, validate_okf_document
 from app.storage import ObjectNotFound, ObjectStorage, PreconditionFailed, StorageError
+from app.work import external_key_for, validate_due, validate_week
 
 
 class SourceAlreadyExists(Exception):
@@ -14,6 +15,19 @@ class SourceAlreadyExists(Exception):
 
 class ContextConflict(Exception):
     pass
+
+
+class WorkStoreRequired(Exception):
+    pass
+
+
+def format_instant(value: datetime | None) -> str | None:
+    """Serialize an instant as RFC 3339 UTC. A naive value is UTC, not local time."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 class WikiService:
@@ -167,29 +181,28 @@ class WikiService:
         wiki_keys, source_keys = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/")
         wiki_keys = self._canonical_scope_keys(wiki_keys)
         source_keys = self._canonical_scope_keys(source_keys)
-        events = self._activity_entries(tenant_id)
         knowledge_pages = [key for key in wiki_keys if key.endswith(".md") and (key.endswith("/context.md") or "/decisions/" in key or "/risks/" in key)]
-        return {"tenant_id": tenant_id, "client_count": len(self._client_ids(tenant_id, wiki_keys)), "project_count": len(self._project_index_keys(tenant_id, wiki_keys)), "source_count": len([key for key in source_keys if key.endswith(".md")]), "wiki_page_count": len([key for key in source_keys if key.endswith(".md")]) + len(knowledge_pages), "last_activity_at": events[0]["timestamp"] if events else None}
+        return {"tenant_id": tenant_id, "client_count": len(self._client_ids(tenant_id, wiki_keys)), "project_count": len(self._project_index_keys(tenant_id, wiki_keys)), "source_count": len([key for key in source_keys if key.endswith(".md")]), "wiki_page_count": len([key for key in source_keys if key.endswith(".md")]) + len(knowledge_pages), "last_activity_at": self._latest_meeting(tenant_id)}
 
     def dashboard_clients(self, tenant_id: str, limit: int, offset: int) -> dict[str, object]:
-        wiki_keys, source_keys, events = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/"), self._activity_entries(tenant_id)
+        wiki_keys, source_keys = self.storage.list_keys(f"wiki/{tenant_id}/"), self.storage.list_keys(f"sources/{tenant_id}/")
         source_keys = self._canonical_scope_keys(source_keys)
         clients = []
         for client_id in self._client_ids(tenant_id, wiki_keys):
             projects = self._project_index_keys(tenant_id, wiki_keys, client_id)
-            clients.append({"client_id": client_id, "project_count": len(projects), "source_count": len([key for key in source_keys if key.startswith(f"sources/{tenant_id}/{client_id}/")]), "last_activity_at": self._last_activity(events, client_id), "key": f"wiki/{tenant_id}/{client_id}/index.md"})
+            clients.append({"client_id": client_id, "project_count": len(projects), "source_count": len([key for key in source_keys if key.startswith(f"sources/{tenant_id}/{client_id}/")]), "last_activity_at": self._latest_meeting(tenant_id, client_id), "key": f"wiki/{tenant_id}/{client_id}/index.md"})
         clients.sort(key=lambda item: item["client_id"])
         return {"total": len(clients), "items": clients[offset:offset + limit], "limit": limit, "offset": offset}
 
     def dashboard_projects(self, tenant_id: str, client_id: str, limit: int, offset: int) -> dict[str, object]:
-        wiki_keys, source_keys, events = self.storage.list_keys(f"wiki/{tenant_id}/{client_id}/"), self.storage.list_keys(f"sources/{tenant_id}/{client_id}/"), self._activity_entries(tenant_id)
+        wiki_keys, source_keys = self.storage.list_keys(f"wiki/{tenant_id}/{client_id}/"), self.storage.list_keys(f"sources/{tenant_id}/{client_id}/")
         projects = []
         for key in self._project_index_keys(tenant_id, wiki_keys, client_id):
             project_id = key.split("/")[3]
             source_count = len([source for source in source_keys if source.startswith(f"sources/{tenant_id}/{client_id}/{project_id}/") and source.endswith(".md")])
             project_prefix = f"wiki/{tenant_id}/{client_id}/{project_id}/"
             knowledge_count = len([wiki_key for wiki_key in wiki_keys if wiki_key.startswith(project_prefix) and wiki_key.endswith(".md") and (wiki_key.endswith("/context.md") or "/decisions/" in wiki_key or "/risks/" in wiki_key)])
-            projects.append({"project_id": project_id, "source_count": source_count, "wiki_page_count": source_count + knowledge_count, "last_activity_at": self._last_activity(events, client_id, project_id), "key": key})
+            projects.append({"project_id": project_id, "source_count": source_count, "wiki_page_count": source_count + knowledge_count, "last_activity_at": self._latest_meeting(tenant_id, client_id, project_id), "key": key})
         projects.sort(key=lambda item: item["project_id"])
         return {"total": len(projects), "items": projects[offset:offset + limit], "limit": limit, "offset": offset}
 
@@ -375,7 +388,25 @@ class WikiService:
                 continue
         raise StorageError("context update conflicted repeatedly")
 
-    def apply_librarian(self, payload: dict[str, object]) -> dict[str, object]:
+    def decision_digest(self, tenant_id: str, client_id: str, project_id: str) -> dict[str, object]:
+        items = []
+        prefix = f"wiki/{tenant_id}/{client_id}/{project_id}/decisions/"
+        for key in self.storage.list_keys(prefix):
+            if not key.endswith(".md"):
+                continue
+            metadata, _ = parse_front_matter(self.storage.get_text(key).text)
+            stem = key.rsplit("/", 1)[-1].removesuffix(".md")
+            timestamp = metadata.get("timestamp")
+            items.append({
+                "id": stem,
+                "document": f"decision:{stem}",
+                "title": metadata.get("title") or self._analysis_title(stem),
+                "timestamp": timestamp if isinstance(timestamp, str) else None,
+            })
+        items.sort(key=lambda item: item["timestamp"] or "", reverse=True)
+        return {"decision_count": len(items), "recent_decisions": items[:3]}
+
+    def apply_librarian(self, payload: dict[str, object], work=None) -> dict[str, object]:
         tenant_id = str(payload["tenant_id"]); client_id = str(payload["client_id"]); project_id = str(payload["project_id"])
         source_key = str(payload["source_key"]); expected_etag = str(payload["expected_context_etag"])
         expected_source_prefix = f"sources/{tenant_id}/{client_id}/{project_id}/"
@@ -442,6 +473,17 @@ class WikiService:
             self._validate_wiki_document(markdown, tenant_id, client_id, project_id, required_type=str(document_type))
             rendered_documents.append((key, markdown))
 
+        meeting_commitments = self._meeting_commitments(payload.get("commitments", []), source_key)
+        if meeting_commitments and work is None:
+            raise WorkStoreRequired("work store is not configured")
+        saved_commitments = []
+        if meeting_commitments:
+            meeting_at = self._source_instant(source_key) or self._parse_timestamp(self._required_text(payload["context"], "timestamp"))
+            saved_commitments = work.upsert_meeting_commitments(
+                tenant_id=tenant_id, client_id=client_id, project_id=project_id, source_key=source_key,
+                meeting_at=meeting_at, items=meeting_commitments,
+            )
+
         output_keys: list[str] = []
         for key, markdown in rendered_documents:
             self._put_if_absent_identical(key, markdown)
@@ -455,7 +497,7 @@ class WikiService:
         self._replace(project_key, self._render_project_index(tenant_id, client_id, project_id))
         output_keys.append(project_key)
         self._append_librarian_log(tenant_id, client_id, project_id, source_key, output_keys)
-        return {"job_id": payload.get("job_id"), "output_keys": output_keys}
+        return {"job_id": payload.get("job_id"), "output_keys": output_keys, "commitment_ids": [item["id"] for item in saved_commitments]}
 
     def maintain_tenant(self, tenant_id: str) -> dict[str, object]:
         wiki_keys = self.storage.list_keys(f"wiki/{tenant_id}/")
@@ -485,9 +527,73 @@ class WikiService:
     def _analysis_title(stem: str) -> str:
         return stem.replace("-", " ").title()
 
+    def _meeting_commitments(self, drafts: object, source_key: str) -> list[dict[str, object]]:
+        if drafts is None:
+            return []
+        if not isinstance(drafts, list):
+            raise ValueError("commitments must be a list")
+        items = []
+        seen: set[str] = set()
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                raise ValueError("each commitment must be an object")
+            title = self._required_text(draft, "title")
+            detail = draft.get("detail", "")
+            evidence = draft.get("evidence", "")
+            if not isinstance(detail, str) or not isinstance(evidence, str):
+                raise ValueError("commitment detail and evidence must be strings")
+            week = draft.get("week") or None
+            if isinstance(week, str) and not week.strip():
+                week = None
+            if week is not None:
+                week = validate_week(week)
+            due_on = validate_due(draft.get("due_on") if draft.get("due_on") not in {"", None} else None)
+            suggested = draft.get("suggested_status") or None
+            if isinstance(suggested, str) and not suggested.strip():
+                suggested = None
+            if suggested not in {None, "done"}:
+                raise ValueError("suggested_status must be done or empty")
+            external = external_key_for(source_key, title)
+            if external in seen:
+                continue
+            seen.add(external)
+            items.append({"title": title.strip(), "detail": detail.strip(), "evidence": evidence.strip(), "week": week, "due_on": due_on, "suggested_status": suggested, "external_key": external})
+        return items
+
+    def _latest_meeting(self, tenant_id: str, client_id: str | None = None, project_id: str | None = None) -> str | None:
+        latest = None
+        for key in self.storage.list_keys(f"sources/{tenant_id}/"):
+            parts = key.split("/")
+            if len(parts) != 5 or not key.endswith(".md"):
+                continue
+            if client_id is not None and parts[2] != client_id:
+                continue
+            if project_id is not None and parts[3] != project_id:
+                continue
+            instant = self._source_instant(key)
+            if instant is not None and (latest is None or instant > latest):
+                latest = instant
+        return format_instant(latest)
+
+    def _source_instant(self, key: str) -> datetime | None:
+        try:
+            metadata, _ = parse_front_matter(self.storage.get_text(key).text)
+        except (ObjectNotFound, ValueError):
+            metadata = {}
+        raw = metadata.get("date_time") if isinstance(metadata, dict) else None
+        if isinstance(raw, str) and raw.endswith("Z"):
+            try:
+                return self._parse_timestamp(raw)
+            except ValueError:
+                pass
+        match = re.search(r"/(\d{4}-\d{2}-\d{2})-[^/]+\.md$", key)
+        if not match:
+            return None
+        return datetime.fromisoformat(match.group(1) + "T00:00:00+00:00")
+
     @staticmethod
     def _updated_at(obj) -> str | None:
-        return obj.last_modified.isoformat().replace("+00:00", "Z") if obj.last_modified else None
+        return format_instant(obj.last_modified)
 
     @staticmethod
     def _canonical_scope_keys(keys: list[str]) -> list[str]:
