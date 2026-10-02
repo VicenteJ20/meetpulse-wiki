@@ -4,7 +4,7 @@ Cloudflare Worker que consume las notificaciones de creación de análisis en R2
 
 ## Preparación
 
-1. Aplica `migrations/0003_librarian.sql` en la misma base D1 utilizada por la API.
+1. Aplica `migrations/0003_librarian.sql` y `migrations/0004_work.sql` en la misma base D1 utilizada por la API. Despliega también la API con sus endpoints de pendientes y notas antes de activar la extracción de compromisos.
 2. Reemplaza en `wrangler.jsonc` el nombre del bucket, el ID de D1 y `LIBRARIAN_API_BASE_URL`.
 3. Crea las colas:
 
@@ -67,3 +67,11 @@ curl -X POST http://127.0.0.1:8787 \
 ```
 
 La Queue local invocarÃ¡ el consumidor; el anÃ¡lisis, el contexto, los jobs y las escrituras continuarÃ¡n usando R2/D1 remotos. No habilites `LIBRARIAN_DEV_MODE` en un despliegue.
+
+## Reprocesar análisis completados antes de la extracción de compromisos
+
+Actualizar el Worker no reprocesa automáticamente los jobs que ya están en `succeeded`. Para un lote autorizado, selecciona las fuentes canónicas por su fecha de carga, comprueba que sus RAW existen y respalda los jobs y contextos antes de reabrir únicamente los IDs seleccionados. Procesa el lote en orden cronológico y espera el resultado de cada job antes del siguiente, especialmente cuando comparten proyecto.
+
+Reenvía a `meetpulse-librarian` un evento JSON `PutObject` con la clave y ETag vigentes. Usa como `eventTime` la fecha actual del reproceso: reutilizar la fecha del evento original puede producir `existing derived document differs`, porque los documentos derivados son inmutables. La fecha de la reunión permanece en la fuente original y sigue determinando la semana predeterminada del compromiso.
+
+Verifica `succeeded`, las salidas en R2 y los compromisos con `source_key` en D1. Contrasta cada acción y evidencia con el análisis; finalmente consulta `list_pending` y `list_my_week` por el plugin. No cambies fuentes históricas ni habilites `LIBRARIAN_DEV_MODE` en producción para reprocesarlas.

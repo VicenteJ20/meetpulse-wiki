@@ -26,6 +26,31 @@ def test_api_requires_bearer_token() -> None:
     assert client.get("/api/v1/dashboard/shared/summary").status_code == 401
 
 
+def test_public_service_routes_do_not_require_google_credentials() -> None:
+    client = TestClient(create_app())
+    assert client.get("/").json()["service"] == "MeetPulse Wiki API"
+    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/docs").status_code == 200
+    schema = client.get("/openapi.json")
+    assert schema.status_code == 200
+    assert "/api/v1/tenants/{tenant_id}/pending" in schema.json()["paths"]
+    assert "/api/v1/tenants/{tenant_id}/notes" in schema.json()["paths"]
+
+
+@pytest.mark.parametrize("path", [
+    "/api/v1/tenants",
+    "/api/v1/tenants/shared/pending",
+    "/api/v1/tenants/shared/notes",
+    "/api/v1/me/week",
+    "/health/private",
+])
+def test_public_service_routes_do_not_bypass_data_authentication(path: str) -> None:
+    client = TestClient(create_app(identity=Identity(), verifier=Verifier()))
+    response = client.get(path)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Bearer token required"
+
+
 def test_guest_cannot_access_another_tenant() -> None:
     client = TestClient(create_app(identity=Identity(), verifier=Verifier()), headers={"Authorization": "Bearer valid"})
     assert client.get("/api/v1/dashboard/private/summary").status_code == 403

@@ -23,6 +23,14 @@ La API acepta ID tokens emitidos para más de un cliente Google OAuth. Conserva 
 
 Clara consume exclusivamente los endpoints de lectura de esta API con el ID token del usuario; no recibe credenciales R2 ni acceso directo al bucket.
 
+## Acceso y comprobación de disponibilidad
+
+`GET /` muestra la información del servicio y `GET /health` devuelve `{"status":"ok"}` sin autenticación. Esta comprobación verifica que la aplicación responde; no comprueba R2 ni D1. `/docs`, `/openapi.json` y `/redoc` también son públicos.
+
+Los endpoints de datos en `/api/v1/` requieren `Authorization: Bearer <Google ID token>`. Abrirlos directamente en el navegador sin ese encabezado devuelve `401 Bearer token required`. El plugin realiza el inicio de sesión Google OAuth a través de `https://meetpulse-wiki-mcp.vercel.app/mcp`, y el MCP adjunta el token al consultar esta API.
+
+Después de incorporar pendientes y notas, aplica `migrations/0004_work.sql` en la misma base D1 configurada en producción y despliega la API actualizada. Actualizar solamente el MCP no publica los endpoints ni crea las tablas del backend.
+
 ## Endpoints
 
 - `POST /api/v1/ingest`: `multipart/form-data` con el análisis `file` (`.md` UTF-8), la transcripción opcional `raw_file` (`.md`/`.txt` UTF-8), alcance, título, fecha y participantes. Devuelve `job_id` y estado de procesamiento.

@@ -52,7 +52,7 @@ def create_app(
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
-        if request.method == "OPTIONS" or request.url.path in {"/docs", "/openapi.json", "/redoc"} or request.url.path.startswith("/api/v1/internal/librarian/"):
+        if request.method == "OPTIONS" or request.url.path in {"/", "/health", "/docs", "/openapi.json", "/redoc"} or request.url.path.startswith("/api/v1/internal/librarian/"):
             return await call_next(request)
         from fastapi.responses import JSONResponse
         header = request.headers.get("authorization", "")
@@ -74,6 +74,19 @@ def create_app(
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         return await call_next(request)
+
+    @app.get("/", include_in_schema=False)
+    def api_info() -> dict[str, str]:
+        return {
+            "service": "MeetPulse Wiki API",
+            "docs": "/docs",
+            "health": "/health",
+            "authentication": "Data endpoints require a Google ID token in Authorization: Bearer <token>.",
+        }
+
+    @app.get("/health", include_in_schema=False)
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
 
     def service(request: Request) -> WikiService:
         if request.app.state.storage is None:
