@@ -66,6 +66,19 @@ class R2Storage:
             region_name=settings.r2_region,
         )
 
+    @staticmethod
+    def _last_modified(response) -> datetime | None:
+        metadata = response.get("Metadata", {})
+        preserved = metadata.get("original-last-modified") if metadata.get("consolidation-import") == "1" else None
+        if preserved:
+            try:
+                parsed = datetime.fromisoformat(preserved.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    return parsed
+            except ValueError:
+                pass
+        return response.get("LastModified")
+
     @classmethod
     def from_environment(cls) -> "R2Storage":
         return cls(Settings())
@@ -76,7 +89,7 @@ class R2Storage:
             return StoredObject(
                 text=response["Body"].read().decode("utf-8"),
                 etag=response["ETag"].strip('"'),
-                last_modified=response.get("LastModified"),
+                last_modified=self._last_modified(response),
             )
         except ClientError as exc:
             if exc.response["Error"].get("Code") in {"NoSuchKey", "404", "NotFound"}:
@@ -95,7 +108,7 @@ class R2Storage:
                 etag=response["ETag"].strip('"'),
                 content_type=response.get("ContentType"),
                 sha256=metadata.get("sha256") or sha256(data).hexdigest(),
-                last_modified=response.get("LastModified"),
+                last_modified=self._last_modified(response),
             )
         except ClientError as exc:
             if exc.response["Error"].get("Code") in {"NoSuchKey", "404", "NotFound"}:

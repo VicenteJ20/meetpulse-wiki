@@ -358,3 +358,61 @@ def test_maintenance_sorts_logs_enriches_indexes_and_is_idempotent() -> None:
     second_headers = {"content-type": "application/json", "x-librarian-timestamp": second_timestamp, "x-librarian-signature": sign_librarian_body(body, second_timestamp, "test-secret")}
     second = client.post("/api/v1/internal/librarian/maintenance", content=body, headers=second_headers)
     assert second.status_code == 200 and second.json()["updated_keys"] == []
+
+
+def test_dashboard_activity_includes_processing_and_sorts_appended_events() -> None:
+    client, storage = api()
+    ingest(client)
+    ingest(client, project_id="other-project")
+    entries = [
+        "- `2026-09-28T20:01:30Z` ingest: `/sources/tenant_1/client-1/project_1/meeting.md` (client=client-1, project=project_1; wiki=)",
+        "- `2026-09-30T19:59:07Z` librarian: `/sources/tenant_1/client-1/project_1/meeting.md` (client=client-1, project=project_1; outputs=)",
+        "- `2026-10-01T01:00:00Z` provenance: `/sources/tenant_1/client-1/other-project/meeting.md` (client=client-1, project=other-project; wiki=)",
+        "- `invalid` ingest: `/sources/tenant_1/client-1/project_1/bad.md` (client=client-1, project=project_1; wiki=)",
+    ]
+    for heading in ("", "## 2026-09-28\n"):
+        storage.objects["wiki/tenant_1/log.md"] = ("# Activity\n" + heading + "\n".join(entries), "test-log")
+        summary = client.get("/api/v1/dashboard/tenant_1/summary").json()
+        clients = client.get("/api/v1/dashboard/tenant_1/clients").json()["items"]
+        projects = client.get("/api/v1/dashboard/tenant_1/clients/client-1/projects").json()["items"]
+        meeting_at = "2026-07-12T19:30:00Z"
+        assert summary["last_activity_at"] == meeting_at
+        assert clients[0]["last_activity_at"] == meeting_at
+        assert next(p for p in projects if p["project_id"] == "project_1")["last_activity_at"] == meeting_at
+        assert next(p for p in projects if p["project_id"] == "other-project")["last_activity_at"] == meeting_at
+        activity = client.get("/api/v1/dashboard/tenant_1/activity").json()["entries"]
+        assert [event["event"] for event in activity] == ["provenance", "librarian", "ingest"]
+
+
+def test_project_last_update_follows_the_meeting_instant() -> None:
+    client, storage = api()
+    ingest(client)
+    newer = "- `2026-10-01T01:00:00Z` librarian: `/sources/tenant_1/client-1/project_1/meeting.md` (client=client-1, project=project_1; outputs=)"
+    storage.objects["wiki/tenant_1/log.md"] = ("# Activity\n## 2026-10-01\n" + "\n".join([newer] * 501), "test-log")
+    project = client.get("/api/v1/dashboard/tenant_1/clients/client-1/projects").json()["items"][0]
+    assert project["last_activity_at"] == "2026-07-12T19:30:00Z"
+
+
+def test_ingest_normalizes_client_and_project_labels():
+    client, storage = api()
+    response = ingest(client, client_id=" CLIENT One ", project_id=" Project Two ")
+    assert response.status_code == 201
+    key = response.json()["source_key"]
+    assert key.startswith("sources/tenant_1/client-one/project-two/")
+    clients = client.get("/api/v1/dashboard/tenant_1/clients").json()["items"]
+    assert [c["client_id"] for c in clients] == ["client-one"]
+    projects = client.get("/api/v1/dashboard/tenant_1/clients/CLIENT%20One/projects").json()["items"]
+    assert [p["project_id"] for p in projects] == ["project-two"]
+
+
+def test_dashboard_does_not_count_retained_legacy_copies_twice():
+    client, storage = api()
+    ingest(client)
+    copies = [(k, v) for k, v in storage.objects.items() if "/client-1/" in k]
+    for key, value in copies:
+        storage.objects[key.replace("/client-1/", "/Client-1/")] = value
+    summary = client.get("/api/v1/dashboard/tenant_1/summary").json()
+    assert summary["client_count"] == 1
+    assert summary["project_count"] == 1
+    assert summary["source_count"] == 1
+    assert summary["wiki_page_count"] == 2
