@@ -32,16 +32,26 @@ interface EntityDraft {
   related: string[];
 }
 
+interface CommitmentDraft {
+  title: string;
+  detail: string;
+  evidence: string;
+  week: string;
+  due_on: string;
+  suggested_status: string;
+}
+
 interface AnalysisResult {
   context: { title: string; description: string; body: string };
   decisions: EntityDraft[];
   risks: EntityDraft[];
+  commitments: CommitmentDraft[];
 }
 
 const ANALYSIS_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["context", "decisions", "risks"],
+  required: ["context", "decisions", "risks", "commitments"],
   properties: {
     context: {
       type: "object", additionalProperties: false,
@@ -52,8 +62,20 @@ const ANALYSIS_SCHEMA = {
     },
     decisions: { type: "array", items: entitySchema() },
     risks: { type: "array", items: entitySchema() },
+    commitments: { type: "array", items: commitmentSchema() },
   },
 } as const;
+
+function commitmentSchema() {
+  return {
+    type: "object", additionalProperties: false,
+    required: ["title", "detail", "evidence", "week", "due_on", "suggested_status"],
+    properties: {
+      title: { type: "string" }, detail: { type: "string" }, evidence: { type: "string" },
+      week: { type: "string" }, due_on: { type: "string" }, suggested_status: { type: "string" },
+    },
+  } as const;
+}
 
 function entitySchema() {
   return {
@@ -132,6 +154,11 @@ async function processSource(event: R2Notification, deliveryAttempts: number, en
   if (event.action !== "PutObject" && event.action !== "CompleteMultipartUpload" && event.action !== "CopyObject") return;
   const scope = parseSourceKey(event.object.key);
   if (!scope) return;
+  // Retained legacy paths are read-only; canonical data owns future processing.
+  if (scope.client !== scope.client.toLowerCase() || scope.project !== scope.project.toLowerCase()) return;
+  // Historical consolidation imports must never rewrite current project context.
+  const imported = await env.WIKI_BUCKET.head(event.object.key);
+  if (imported?.customMetadata?.["consolidation-import"] === "1") return;
   const jobId = await sha256Hex(event.object.key).then((value) => value.slice(0, 32));
   await ensureJob(jobId, event.object.key, scope, env);
   const job = await env.DB.prepare("SELECT status,analysis_payload FROM librarian_jobs WHERE job_id=?").bind(jobId).first<{ status: string; analysis_payload: string | null }>();
@@ -179,6 +206,10 @@ async function processSource(event: R2Notification, deliveryAttempts: number, en
         ...analysis.decisions.map((item) => renderEntity(item, "decision", timestamp)),
         ...analysis.risks.map((item) => renderEntity(item, "risk", timestamp)),
       ],
+      commitments: analysis.commitments.map((item) => ({
+        title: item.title.trim(), detail: item.detail.trim(), evidence: item.evidence.trim(),
+        week: item.week.trim(), due_on: item.due_on.trim(), suggested_status: item.suggested_status.trim(),
+      })),
     };
     const response = await signedPost("/api/v1/internal/librarian/apply", applyPayload, env);
     if (response.status === 409) {
@@ -241,6 +272,10 @@ function librarianPrompt(): string {
     "Acciones, anuncios o decisiones de gobiernos, empresas u otros terceros que la reunión solo comenta son contexto, nunca decisiones del proyecto.",
     "Si el análisis dice que no hubo decisiones, decisions debe ser [].",
     "Compromisos, tareas y puntos sin resolver van a Pendientes, no a decisions.",
+    "Cada acción explícita va además en commitments, una fila por acción. Si no hay acciones, commitments es [].",
+    "title es la acción. detail y evidence pueden ser vacíos. week es YYYY-Www solo si hay un plazo; si no, cadena vacía. due_on es YYYY-MM-DD o cadena vacía.",
+    "suggested_status es done solo cuando la reunión dice explícitamente que esa acción ya quedó hecha; si no, cadena vacía. No lo infieras.",
+    "No inventes compromisos.",
     "Solo crea un risk si hay impacto, bloqueo, amenaza o probabilidad adversa explícita.",
     "Ese impacto debe estar vinculado explícitamente con ESTE proyecto; riesgos de terceros tratados como noticia o análisis de mercado no son risks del proyecto.",
     "Una reunión informativa normalmente produce decisions=[] y risks=[]. No crees archivos atómicos solo para aumentar cobertura.",
@@ -284,16 +319,24 @@ async function readCatalog(scope: ReturnType<typeof parseSourceKey> & {}, env: E
 }
 
 function validateAnalysis(value: AnalysisResult): void {
-  if (!value || typeof value !== "object" || !value.context || !Array.isArray(value.decisions) || !Array.isArray(value.risks)) throw new Error("invalid_analysis_shape");
+  if (!value || typeof value !== "object" || !value.context || !Array.isArray(value.decisions) || !Array.isArray(value.risks) || !Array.isArray(value.commitments)) throw new Error("invalid_analysis_shape");
   if (!/^# Estado actual\s*$/mi.test(value.context.body) || !/^## Hitos\s*$/mi.test(value.context.body) || !/^## Pendientes\s*$/mi.test(value.context.body)) throw new Error("invalid_context_sections");
   for (const item of [...value.decisions, ...value.risks]) {
     const fields = [item.title, item.description, item.statement, item.project_impact, item.next_step, item.evidence_section, item.evidence_summary];
     if (fields.some((field) => typeof field !== "string" || !field.trim()) || !Array.isArray(item.supersedes) || !Array.isArray(item.related)) throw new Error("invalid_entity_shape");
   }
+  for (const item of value.commitments) {
+    if (typeof item.title !== "string" || !item.title.trim()) throw new Error("invalid_commitment_shape");
+    if ([item.detail, item.evidence, item.week, item.due_on, item.suggested_status].some((field) => typeof field !== "string")) throw new Error("invalid_commitment_shape");
+    if (item.week && !/^\d{4}-W(0[1-9]|[1-4]\d|5[0-3])$/.test(item.week)) throw new Error("invalid_commitment_week");
+    if (item.due_on && !/^\d{4}-\d{2}-\d{2}$/.test(item.due_on)) throw new Error("invalid_commitment_due");
+    if (item.suggested_status !== "" && item.suggested_status !== "done") throw new Error("invalid_commitment_status");
+  }
 }
 
 function usesCurrentEntitySchema(value: AnalysisResult): boolean {
-  if (!value || !Array.isArray(value.decisions) || !Array.isArray(value.risks)) return false;
+  if (!value || !Array.isArray(value.decisions) || !Array.isArray(value.risks) || !Array.isArray(value.commitments)) return false;
+  if (value.commitments.some((item) => typeof item.title !== "string" || !item.title.trim())) return false;
   return [...value.decisions, ...value.risks].every((item) =>
     [item.statement, item.project_impact, item.next_step, item.evidence_section, item.evidence_summary]
       .every((field) => typeof field === "string" && field.trim().length > 0),
